@@ -1,20 +1,13 @@
 /**
  * The Railway suite's cluster: Railway Postgres and a runner Service per
- * pool, in an environment of the shared suite project.
+ * pool, in the Railway suites' partition of their shared project.
  */
 import * as ClusterRailway from "@alchemy.run/effect-cluster/Railway";
-import { Environment } from "@alchemy.run/railway/ProjectEnvironment";
 import * as Layer from "effect/Layer";
-import { suiteProject } from "../../../Railway/suiteProject.ts";
-
-/** The shared suite project: not a stack resource, so destroy keeps it. */
-export const Project = suiteProject;
-
-/** The suite's own environment, which destroy deletes. */
-export const Partition = Environment("ClusterPartition", { project: Project });
+import { Partition, Site } from "../../../Railway/fixtures/suite-env.ts";
 
 export const Database = ClusterRailway.Database("Cluster", {
-  project: Project,
+  project: Site,
   environment: Partition,
 });
 

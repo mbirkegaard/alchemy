@@ -12,10 +12,7 @@ import { Lives } from "./fixtures/railway/index.ts";
 import { scheduledConformanceTests } from "./scheduled-conformance.ts";
 import { workflowConformanceTests } from "./workflow-conformance.ts";
 
-const testOptions = {
-  limit: railwayApi,
-  providers: Layer.mergeAll(Railway.providers(), Cluster.providers()),
-};
+const testOptions = { providers: Layer.mergeAll(Railway.providers(), Cluster.providers()) };
 const { test, beforeAll, afterAll } = Test.make(testOptions);
 const sharedStack = Core.scratchStack(testOptions, "ClusterRailway", import.meta.url);
 
@@ -41,10 +38,14 @@ describe.skipIf(!!process.env.FAST)(
         baseUrl = String(url).replace(/\/+$/, "");
         yield* waitForReady(baseUrl);
       }),
-      { timeout: 1_800_000 },
+      // Only deploy and destroy drive Railway's API. The cases call the front.
+      { timeout: 1_800_000, exclusive: railwayApi },
     );
 
-    afterAll.skipIf(!!process.env.NO_DESTROY)(sharedStack.destroy(), { timeout: 1_200_000 });
+    afterAll.skipIf(!!process.env.NO_DESTROY)(sharedStack.destroy(), {
+      timeout: 1_200_000,
+      exclusive: railwayApi,
+    });
 
     conformanceTests(test as never, { baseUrl: () => baseUrl, kind: "live" });
     workflowConformanceTests(test as never, { baseUrl: () => baseUrl, kind: "live" });

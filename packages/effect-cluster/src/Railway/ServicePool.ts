@@ -60,6 +60,7 @@ export const ServicePool = (
     id,
     settings: options,
     expected: "a Railway project (ClusterRailway.Database)",
+    networkOption: "project",
     // A private hostname is one DNS label.
     nameLength: 63,
     network: (database) => (database.network?.kind === "railway" ? database.network : undefined),

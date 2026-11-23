@@ -12,7 +12,7 @@ export interface DatabaseProps {
   /** The Railway project the database and runners run in. */
   project: Input<Railway.PostgresProps["project"]>;
   /**
-   * The environment they run in.
+   * The Railway environment the database and runners run in.
    * @default the project's primary environment
    */
   environment?: Input<Railway.PostgresProps["environment"]>;

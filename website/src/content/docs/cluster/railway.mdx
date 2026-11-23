@@ -34,7 +34,7 @@ Install `@alchemy.run/railway` and finish [Railway setup](/railway/setup).
 
 ## The database
 
-`ClusterRailway.Database` runs Postgres in the environment you specify, or the project's primary environment if you omit it. It has no public TCP proxy. Runners connect using `${{name.DATABASE_URL}}`, which Railway resolves to the private database URL.
+`ClusterRailway.Database` runs Postgres in the environment you specify, or the project's primary environment if you omit it. It has no public TCP proxy. Runners connect using `${{name.DATABASE_URL}}`, which Railway resolves to the private database URL. `retain: true` keeps Postgres when you remove the declaration or destroy the stage. It doesn't apply to the project or environment, and deleting either one deletes Postgres with it.
 
 ```typescript title="src/Cluster.ts"
 export const Staging = Railway.Environment("Staging", { project: Project });
@@ -61,7 +61,7 @@ export const Default = ClusterRailway.ServicePool("Default", { region: "us-west2
 
 ## Call it from a Railway Service
 
-A Service in the same environment reaches the gateway on the private network. Railway checks a Service at `/health` before it takes traffic, so answer that without calling the cluster:
+A Service in the same environment reaches the gateway on the private network. Alchemy sets the Service's Railway healthcheck to `/health`, and Railway waits for it to pass before the Service takes traffic, so answer that without calling the cluster:
 
 ```typescript title="src/Api.ts"
 import * as Railway from "@alchemy.run/railway";

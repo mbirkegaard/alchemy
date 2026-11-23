@@ -148,6 +148,8 @@ export const makePoolLayer = <Network, Req, Gateway extends PoolGateway = PoolGa
    */
   readonly ownNetwork?: Effect.Effect<Network | undefined, never, Req | Stack>;
   readonly expected: string;
+  /** The pool option that gives runners their own network, named when a database is on none. @default "network" */
+  readonly networkOption?: string;
   /** The longest runner name the host accepts. @default 63 */
   readonly nameLength?: number;
   /** The runner image's Dockerfile, when the host needs more than {@link RUNNER_DOCKERFILE}. */
@@ -183,7 +185,7 @@ export const makePoolLayer = <Network, Req, Gateway extends PoolGateway = PoolGa
           new DatabaseNetworkMismatch({
             message:
               database.network === undefined
-                ? `${options.label} runs runners on ${options.expected}, and its database is on no network: pass the pool a \`network\`.`
+                ? `${options.label} runs runners on ${options.expected}, and its database is on no network: pass the pool a \`${options.networkOption ?? "network"}\`.`
                 : `${options.label} runs runners on ${options.expected}, and its database is on a ${database.network.kind} network.`,
           }),
         );

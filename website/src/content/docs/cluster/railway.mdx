@@ -1,0 +1,91 @@
+---
+title: Railway
+description: Run an Effect Cluster's database and runners on Railway, in a project's environment, with the gateway on its private network.
+---
+
+import Tree from "../../../components/diagrams/Tree.astro";
+
+Host your cluster on Railway: Postgres runs as a Railway Postgres service, and each pool runs as a Railway Service, all in one environment of your project. Everything talks over the project's private network, and the gateway is served at `http://{name}.railway.internal:34500`, so services in the same environment call the cluster without a public domain.
+
+```typescript title="src/Cluster.ts"
+import * as ClusterRailway from "@alchemy.run/effect-cluster/Railway";
+import * as Railway from "@alchemy.run/railway";
+import * as Layer from "effect/Layer";
+
+export const Project = Railway.Project("App");
+
+export const Database = ClusterRailway.Database("Cluster", { project: Project });
+
+export const Default = ClusterRailway.ServicePool("Default").pipe(Layer.provide(Database));
+```
+
+Install `@alchemy.run/railway` and finish [Railway setup](/railway/setup).
+
+<Tree
+  nodes={[
+    { id: "project", label: "Railway project", type: "your project" },
+    { id: "env", label: "environment", type: "private network *.railway.internal", parent: "project", dashed: true },
+    { id: "db", label: "Database", type: "Railway Postgres", parent: "env", specs: [["data", "volume"]] },
+    { id: "pool", label: "Default", type: "Railway Service · one runner", parent: "env" },
+    { id: "api", label: "Api", type: "Railway Service", parent: "env" },
+  ]}
+  caption="The runner reaches Postgres over the private network, and callers in the environment reach the runner's gateway there. Neither has a public endpoint."
+/>
+
+## The database
+
+`ClusterRailway.Database` runs a Railway Postgres in the project's `environment`, or its primary one. It has no TCP proxy, so nothing outside the project reaches it. Runners are given it as the Railway reference `${{name.DATABASE_URL}}`, which Railway resolves to its private URL.
+
+```typescript title="src/Cluster.ts"
+export const Staging = Railway.Environment("Staging", { project: Project });
+
+export const Database = ClusterRailway.Database("Cluster", {
+  project: Project,
+  environment: Staging,
+  name: "cluster-db",
+  retain: true,
+});
+```
+
+## The pool
+
+`ClusterRailway.ServicePool` runs one Railway Service, built from the bundled runner program, in the database's environment. Railway gives every replica of a Service the same private hostname, so a pool runs one runner. For more runners, declare more pools.
+
+```typescript title="src/Cluster.ts"
+export const Default = ClusterRailway.ServicePool("Default", { region: "us-west2" }).pipe(
+  Layer.provide(Database),
+);
+```
+
+With `Cluster.Database.fromUrl`, the database is in no Railway project: give the pool its `project`, and its `environment` if not the primary one.
+
+## Call it from a Railway Service
+
+A Service in the same environment reaches the gateway on the private network. Railway checks a Service at `/health` before it takes traffic, so answer that without calling the cluster:
+
+```typescript title="src/Api.ts"
+import * as Railway from "@alchemy.run/railway";
+import * as Effect from "effect/Effect";
+import { HttpServerRequest } from "effect/http/HttpServerRequest";
+import * as HttpServerResponse from "effect/http/HttpServerResponse";
+import { Project, Staging } from "./Cluster.ts";
+import { Room } from "./Room.ts";
+
+export default class Api extends Railway.Service<Api>()(
+  "Api",
+  { project: Project, environment: Staging, main: import.meta.url },
+  Effect.gen(function* () {
+    const rooms = yield* Room;
+    return {
+      fetch: Effect.gen(function* () {
+        const request = yield* HttpServerRequest;
+        if (request.url === "/health") return HttpServerResponse.text("ok");
+        const lobby = yield* rooms.getByName("lobby");
+        return yield* HttpServerResponse.json({ members: yield* lobby.Join({ name: "sam" }) });
+      }).pipe(Effect.orDie),
+    };
+  }),
+) {}
+```
+
+Every option, with its default, is in the reference: [Database](/providers/cluster/railway#database) and [ServicePool](/providers/cluster/railway#servicepool).

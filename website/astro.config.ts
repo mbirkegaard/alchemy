@@ -2451,6 +2451,7 @@ export default defineConfig({
                 { label: "Kubernetes", link: "/cluster/kubernetes" },
                 { label: "Fly", link: "/cluster/fly" },
                 { label: "Hetzner", link: "/cluster/hetzner" },
+                { label: "Railway", link: "/cluster/railway" },
                 { label: "Cloudflare", link: "/cluster/cloudflare" },
               ],
             },

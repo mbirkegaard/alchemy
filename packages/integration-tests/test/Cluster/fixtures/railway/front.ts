@@ -14,7 +14,7 @@ export default class Front extends Railway.Service<Front>()(
     environment: Partition,
     main: import.meta.url,
     port: 3000,
-    // The front answers `/ready`; Railway probes `/health` by default.
+    // Use `/ready` instead of Railway's default `/health` probe.
     healthcheck: "/ready",
   },
   frontApp(Tally),

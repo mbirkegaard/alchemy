@@ -59,11 +59,11 @@ export type ClusterNetwork =
       readonly namespace: string;
     }
   | {
-      /** A Railway project's private network; runners run in its environment. */
+      /** The private network of the Railway environment where the runners run. */
       readonly kind: "railway";
       /** The project, as `@alchemy.run/railway` takes it. */
       readonly project: unknown;
-      /** The environment, as `@alchemy.run/railway` takes it; the project's primary one when absent. */
+      /** The Railway environment. Defaults to the project's primary environment. */
       readonly environment?: unknown;
     };
 

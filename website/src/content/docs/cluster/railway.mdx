@@ -5,7 +5,7 @@ description: Run an Effect Cluster's database and runners on Railway, in a proje
 
 import Tree from "../../../components/diagrams/Tree.astro";
 
-Host your cluster on Railway: Postgres runs as a Railway Postgres service, and each pool runs as a Railway Service, all in one environment of your project. Everything talks over the project's private network, and the gateway is served at `http://{name}.railway.internal:34500`, so services in the same environment call the cluster without a public domain.
+Postgres and the runner pool run as separate services in the same Railway environment. Alchemy builds the gateway URL from the runner service's name. For example, a service named `todos-runners` serves its gateway at `http://todos-runners.railway.internal:34500`. Port `34500` is the Effect Cluster gateway port, not a Railway default. Only services in the same environment can reach that address. You don't set it yourself or need a public domain.
 
 ```typescript title="src/Cluster.ts"
 import * as ClusterRailway from "@alchemy.run/effect-cluster/Railway";
@@ -34,7 +34,7 @@ Install `@alchemy.run/railway` and finish [Railway setup](/railway/setup).
 
 ## The database
 
-`ClusterRailway.Database` runs a Railway Postgres in the project's `environment`, or its primary one. It has no TCP proxy, so nothing outside the project reaches it. Runners are given it as the Railway reference `${{name.DATABASE_URL}}`, which Railway resolves to its private URL.
+`ClusterRailway.Database` runs Postgres in the environment you specify, or the project's primary environment if you omit it. It has no public TCP proxy. Runners connect using `${{name.DATABASE_URL}}`, which Railway resolves to the private database URL.
 
 ```typescript title="src/Cluster.ts"
 export const Staging = Railway.Environment("Staging", { project: Project });
@@ -57,7 +57,7 @@ export const Default = ClusterRailway.ServicePool("Default", { region: "us-west2
 );
 ```
 
-With `Cluster.Database.fromUrl`, the database is in no Railway project: give the pool its `project`, and its `environment` if not the primary one.
+`Cluster.Database.fromUrl` does not tell the pool where to run. Pass `project` to the pool, and pass `environment` if you are not using the project's primary environment.
 
 ## Call it from a Railway Service
 

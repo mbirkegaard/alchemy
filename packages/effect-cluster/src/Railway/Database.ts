@@ -49,6 +49,18 @@ export interface DatabaseProps {
  * export const Database = ClusterRailway.Database("Cluster", { project: Project });
  * ```
  *
+ * **Example:** A retained database in another environment
+ * ```typescript
+ * export const Staging = Railway.Environment("Staging", { project: Project });
+ *
+ * export const Database = ClusterRailway.Database("Cluster", {
+ *   project: Project,
+ *   environment: Staging,
+ *   name: "cluster-db",
+ *   retain: true,
+ * });
+ * ```
+ *
  * @primitive
  */
 export const Database = (

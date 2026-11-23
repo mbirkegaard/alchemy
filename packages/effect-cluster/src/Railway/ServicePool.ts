@@ -49,6 +49,18 @@ export interface ServicePoolOptions extends PoolSettings {
  * export const Default = ClusterRailway.ServicePool("Default").pipe(Layer.provide(Database));
  * ```
  *
+ * **Example:** A pool on a database you already run
+ * ```typescript
+ * export const Database = Cluster.Database.fromUrl({
+ *   url: Config.Redacted("CLUSTER_DATABASE_URL"),
+ * });
+ *
+ * export const Default = ClusterRailway.ServicePool("Default", {
+ *   project: Project,
+ *   region: "us-west2",
+ * }).pipe(Layer.provide(Database));
+ * ```
+ *
  * @primitive
  */
 export const ServicePool = (

@@ -61,6 +61,7 @@ import type { HostedSingleton } from "../Singleton.ts";
 import type { HostedWorkflow } from "../Workflow.ts";
 import { GATEWAY_PORT, RUNNER_PORT, gatewayLayer } from "./Gateway.ts";
 import { HasNoPool, type HostedRuntimeContext } from "./HostedRuntime.ts";
+import * as RunnerTransport from "./RunnerTransport.ts";
 
 const env = (name: string) => process.env[name];
 
@@ -539,11 +540,9 @@ export const bootstrap = (
       Layer.provide(ShardingConfig.layerFromEnv(shardingConfig)),
       Layer.provide(clusterDatabase),
     );
-    const cluster = NodeClusterHttp.layer({
-      transport: "http",
-      storage: "byo",
-      shardingConfig,
-    }).pipe(Layer.provideMerge(storage));
+    // Effect Cluster over HTTP, whose requests to a runner the platform
+    // removed fail fast and are routed again (see RunnerTransport).
+    const cluster = RunnerTransport.layer(shardingConfig).pipe(Layer.provideMerge(storage));
     // Singletons and crons run in this pool's shard group too, each with
     // the services its Construction phase had.
     const scheduled = hosted.flatMap((entry) =>

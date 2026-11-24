@@ -118,6 +118,8 @@ describe.skipIf(!!process.env.FAST)(
   { tags: ["provider:cluster", "provider:railway", "live"] },
   () => {
     let service = "";
+    /** Every replica the suite has seen run entities: the pool's before it scales down. */
+    const seenReplicas = new Set<string>();
     beforeAll(
       Effect.gen(function* () {
         if (!process.env.NO_DESTROY) yield* replicasStack.destroy();
@@ -140,6 +142,7 @@ describe.skipIf(!!process.env.FAST)(
         // Each replica registered under an address of its own.
         expect(new Set(placed.map((p) => p.addresses[0])).size).toBe(3);
         service = placed[0]!.service;
+        for (const p of placed) seenReplicas.add(p.replica);
       }),
       { timeout: 300_000 },
     );
@@ -171,8 +174,30 @@ describe.skipIf(!!process.env.FAST)(
       Effect.gen(function* () {
         const id = `scale-${Date.now()}`;
         expect((yield* untilAnswered<{ value: number }>(`/credit/${id}/tx1/3`, 120)).value).toBe(3);
+        // The replicas serving before the scale-down, including one the crash
+        // case restarted.
+        const before = new Set(seenReplicas);
+        for (const p of yield* placements(`before-${Date.now()}`, 12)) before.add(p.replica);
         yield* deployReplicas(OneLive);
-        const placed = yield* placements(`one-${Date.now()}`, 12);
+        // The deploy returns once the new deployment is up; Railway retires
+        // the previous one's replicas a moment later (0.5 s in Greenfield
+        // #62), and until then they still run entities. Wait, for a minute at
+        // most, until no entity runs on a replica from before: the previous
+        // deployment is gone and the new one runs them all.
+        const prefix = `one-${Date.now()}`;
+        const placed = yield* placements(prefix, 12).pipe(
+          Effect.filterOrFail(
+            (all) => all.every((p) => !before.has(p.replica)),
+            (all) =>
+              new NotReady({
+                detail: `entities still on replicas from before the scale-down: ${all
+                  .filter((p) => before.has(p.replica))
+                  .map((p) => `${p.id}@${p.replica}`)
+                  .join(", ")}`,
+              }),
+          ),
+          Effect.retry({ schedule: Schedule.spaced("2 seconds"), times: 30 }),
+        );
         expect(new Set(placed.map((p) => p.replica)).size).toBe(1);
         expect(placed[0]!.service).toBe(service);
         // The stored reply outlived the scale-down: the database is the same one.

@@ -17,7 +17,7 @@ jobs:
       matrix:
         include:
           - variant: integrated
-            sha: f9778af21fdf4586e4996359a2d159cc5e8d339c
+            sha: 30324324ff474019b7bed78a1a0f4723101162da
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -50,6 +50,16 @@ jobs:
         run: |
           evidence="$RUNNER_TEMP/swarm-evidence"
           mkdir -p "$evidence"
+          # Observe the actual Docker response immediately after creation,
+          # then once allocation has had time to complete.
+          for i in $(seq 1 30); do
+            network=$(docker network create --driver overlay "allocation-sample-$i")
+            immediate=$(docker network inspect --format '{{.Driver}}|{{len .IPAM.Config}}' "$network")
+            sleep 1
+            settled=$(docker network inspect --format '{{.Driver}}|{{len .IPAM.Config}}' "$network")
+            docker network rm "$network" >/dev/null
+            printf '%s immediate=%s settled=%s\n' "$i" "$immediate" "$settled"
+          done | tee "$evidence/allocation.log"
           docker events --filter event=kill --filter event=die --filter event=start \
             --format '{{.TimeNano}} {{.Action}} {{.Actor.ID}} {{index .Actor.Attributes "com.docker.swarm.service.name"}}' > "$evidence/events.log" 2>&1 &
           events=$!
@@ -79,6 +89,12 @@ jobs:
             if [ -n "$full_log" ] && [ -f "$full_log" ]; then
               grep -E 'every key answered' "$full_log" > "$evidence/recovery-$round.log" || true
             fi
+          done
+          for round in 1 2 3; do
+            timeout --kill-after=15s 4m pnpm test:integration test/Cluster/Domain.test.ts \
+              -t 'a version bump rebuilds a projection' --retry 0 --concurrency 1 \
+              2>&1 | tee "$evidence/rebuild-$round.log" || result=1
+            grep -Eq 'Tests: 0 failed \| 1 passed' "$evidence/rebuild-$round.log" || result=1
           done
           grep -hE 'Tests:|every key answered|is unreachable' "$evidence"/*.log || true
           exit "$result"

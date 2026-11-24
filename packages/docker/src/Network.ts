@@ -512,10 +512,49 @@ const makeNetworkArgs = (id: string, props: NetworkProps | undefined, instanceId
       ipv4: props?.enableIPv4,
       ipv6: props?.enableIPv6 ?? false,
       opt: props?.driverOpts,
-      ipam: props?.ipam,
+      ipam: props?.ipam === undefined ? undefined : canonicalIpam(props.ipam),
       label: props?.labels ?? {},
     })),
   );
+
+/** An address or prefix in canonical form (`fd62::/64`), or as written if it doesn't parse. */
+const canonicalNetwork = (cidr: string) => {
+  const parsed = parseNetwork(cidr);
+  return Result.isSuccess(parsed) ? Net.IpNetwork.format(parsed.success) : cidr;
+};
+const canonicalAddress = (address: string) => {
+  const parsed = parseIpAddress(address);
+  return Result.isSuccess(parsed) ? Net.NetAddress.formatIp(parsed.success) : address;
+};
+
+/**
+ * IPAM addresses as Docker gets them: in canonical form. Docker 28.0 keeps
+ * an IPv6 subnet as written (`fd62:…:0000:0000/64`) where later engines
+ * store `fd62:…::/64`, so the same props made different networks.
+ */
+const canonicalIpam = (ipam: NetworkIpam): NetworkIpam => ({
+  ...ipam,
+  ...(ipam.config === undefined
+    ? {}
+    : {
+        config: ipam.config.map((entry) => ({
+          ...entry,
+          subnet: canonicalNetwork(entry.subnet),
+          ...(entry.gateway === undefined ? {} : { gateway: canonicalAddress(entry.gateway) }),
+          ...(entry.ipRange === undefined ? {} : { ipRange: canonicalNetwork(entry.ipRange) }),
+          ...(entry.auxAddresses === undefined
+            ? {}
+            : {
+                auxAddresses: Object.fromEntries(
+                  Object.entries(entry.auxAddresses).map(([name, address]) => [
+                    name,
+                    canonicalAddress(address),
+                  ]),
+                ),
+              }),
+        })),
+      }),
+});
 
 const matchesOptions = (actual: Record<string, string>, desired: Record<string, string>) =>
   Object.entries(desired).every(([key, value]) => actual[key] === value);

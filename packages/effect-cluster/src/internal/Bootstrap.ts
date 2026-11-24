@@ -267,6 +267,34 @@ export class ExternalProgramExited extends Data.TaggedError("Cluster.ExternalPro
   readonly code: number | null;
 }> {}
 
+/**
+ * `CLUSTER_SHUTDOWN_TIMEOUT_MS`: how long a runner may take to stop once it
+ * is signalled. Unset, a runner ignores SIGTERM like any process with no
+ * handler (as PID 1 in a container), and is killed with its shards held.
+ */
+const shutdownBudget = () => {
+  const value = env("CLUSTER_SHUTDOWN_TIMEOUT_MS");
+  return value !== undefined && /^[1-9][0-9]*$/.test(value) ? Number(value) : undefined;
+};
+
+/**
+ * Succeeds on the first SIGTERM or SIGINT. From then on, a native timer
+ * exits the process after `budgetMs`, should stopping hang.
+ */
+const stopSignal = (budgetMs: number) =>
+  Effect.callback<void>((resume) => {
+    const stop = (signal: NodeJS.Signals) => {
+      setTimeout(() => process.exit(1), budgetMs).unref();
+      resume(Effect.logInfo(`Effect Cluster runner stopping on ${signal}`));
+    };
+    process.once("SIGTERM", stop);
+    process.once("SIGINT", stop);
+    return Effect.sync(() => {
+      process.off("SIGTERM", stop);
+      process.off("SIGINT", stop);
+    });
+  });
+
 /** The shard groups this pool serves, and every group in the cluster. */
 const shardGroupsConfig = () => {
   const list = (name: string) =>
@@ -424,7 +452,7 @@ export const bootstrap = (
         )
         .join(", ")}`,
     );
-    return yield* Layer.launch(
+    const run = Layer.launch(
       Layer.mergeAll(
         ...(entityLayers as [Layer.Layer<never>]),
         ...(workflowLayers as Layer.Layer<never, never, any>[]),
@@ -438,7 +466,19 @@ export const bootstrap = (
         Layer.provide(cluster),
       ),
     );
+    const budget = shutdownBudget();
+    // Stopping interrupts the runner, whose cluster hands its shards back
+    // and unregisters it on the way out, so the others take its shards now
+    // rather than once its registration expires.
+    return budget === undefined
+      ? yield* run
+      : yield* Effect.raceFirst(run, stopSignal(budget)).pipe(
+          Effect.andThen(Effect.logInfo("Effect Cluster runner stopped")),
+        );
   }).pipe(Effect.provide(platform), Effect.scoped);
 
-  return runProcess("Effect Cluster runner", program as Effect.Effect<never, unknown, never>);
+  return runProcess("Effect Cluster runner", program as Effect.Effect<never, unknown, never>, {
+    // A runner only completes once it was stopped.
+    exitOnComplete: true,
+  });
 };

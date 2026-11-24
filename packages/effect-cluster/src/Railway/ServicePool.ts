@@ -10,6 +10,9 @@ import { DatabaseNetworkMismatch, makePoolLayer, type PoolSettings } from "../in
 import type { PoolHost } from "../internal/PoolHostService.ts";
 import type { Providers } from "../Providers.ts";
 
+/** How long Railway lets a replica's runner stop before killing it. */
+const RUNNER_DRAINING_SECONDS = 30;
+
 export interface ServicePoolOptions extends PoolSettings {
   /**
    * Region of the runner.
@@ -31,7 +34,8 @@ export interface ServicePoolOptions extends PoolSettings {
    * registers under its own private address, the one it reaches the
    * database from, so they serve one shard group; the Service's private
    * hostname stays the gateway callers reach. Needs the database on the
-   * project's private network (`ClusterRailway.Database`). Setting it, even to 1, also
+   * project's private network (`ClusterRailway.Database`). A replica that
+   * Railway stops hands its shards back before it exits. Setting it, even to 1, also
    * keeps an overlapping deployment's runner distinct from the one it
    * replaces.
    * @default one runner, registered under the Service's private hostname
@@ -120,7 +124,14 @@ export const ServicePool = (
             healthcheck: "/health",
             publicDomain: false,
             ...(options.region === undefined ? {} : { region: options.region }),
-            ...(options.replicas === undefined ? {} : { replicas: options.replicas }),
+            ...(options.replicas === undefined
+              ? {}
+              : {
+                  replicas: options.replicas,
+                  // Time between SIGTERM and SIGKILL, for a stopping runner to
+                  // hand its shards back (CLUSTER_SHUTDOWN_TIMEOUT_MS, below).
+                  drainingSeconds: RUNNER_DRAINING_SECONDS,
+                }),
             env: environment.pipe(
               Output.map((env) => ({
                 ...env,
@@ -132,7 +143,10 @@ export const ServicePool = (
                   : // Every replica shares that hostname, which lists none of
                     // them until their deployment is live: each registers under
                     // its own private address, the one it reaches the database from.
-                    { CLUSTER_RUNNER_ROUTE: "database" }),
+                    {
+                      CLUSTER_RUNNER_ROUTE: "database",
+                      CLUSTER_SHUTDOWN_TIMEOUT_MS: String((RUNNER_DRAINING_SECONDS - 5) * 1000),
+                    }),
               })),
             ),
           }).pipe(Effect.asVoid),

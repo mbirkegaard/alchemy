@@ -56,11 +56,12 @@ export interface ServicePoolOptions extends PoolSettings {
  * deploy, restart and scale; it hands its shards back and unregisters, so
  * the other runners take them within seconds. Railway restarts a runner
  * that crashes under the same address, and it takes its shards back; one
- * that stays down loses them at the pool's next health check, every 5
- * seconds, or once its registration expires (35 seconds) if it ran that
- * check itself. Callers retry a request that couldn't reach the gateway
- * while its hostname still lists a stopped runner. With a database
- * elsewhere, the pool runs one runner under the Service's hostname.
+ * that stays down loses them within about 10 seconds, since the pool's
+ * runners ping each other every 5 seconds. A message one runner forwards to
+ * a replica Railway has just removed is sent again to its shard's new
+ * owner. Callers retry a request that couldn't reach the gateway while its
+ * hostname still lists a stopped runner. With a database elsewhere, the
+ * pool runs one runner under the Service's hostname.
  *
  * ### Running on Railway
  * **Example:** A pool beside its database

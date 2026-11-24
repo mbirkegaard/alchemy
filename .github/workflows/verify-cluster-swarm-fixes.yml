@@ -16,12 +16,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - variant: baseline
-            sha: d2ca3de15e2c6cb8406a8d6f3166d48314e9bcce
-          - variant: network-and-single-ping
-            sha: 6ac9842025b3ae4d73442da061860f3ba5aa8882
-          - variant: all-fixes
-            sha: 6a0fcb0c512e9a4f83e848e87ba7d9ca3312ccf8
+          - variant: integrated
+            sha: f9778af21fdf4586e4996359a2d159cc5e8d339c
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -47,12 +43,6 @@ jobs:
           fixture=packages/integration-tests/test/Docker/Runtime.ts
           test "$(grep -c 'http://localhost:' "$fixture")" -eq 1
           sed -i 's|http://localhost:|http://127.0.0.1:|' "$fixture"
-          # Use the same readiness probe on every variant, without changing product code.
-          readiness=6a0fcb0c512e9a4f83e848e87ba7d9ca3312ccf8
-          if [ "$(git rev-parse HEAD)" != "$readiness" ]; then
-            git fetch --no-tags --depth=2 origin "$readiness"
-            git diff "$readiness^" "$readiness" -- packages/integration-tests/test/Domain/conformance/conformance.ts | git apply
-          fi
           git diff --check
           git diff --stat
       - name: Run suites and collect runner diagnostics
@@ -76,7 +66,7 @@ jobs:
           observer=$!
           trap 'kill "$observer" "$events" 2>/dev/null || true' EXIT
           result=0
-          for suite in Docker/Network Cluster/Docker Cluster/Domain; do
+          for suite in Docker/Network Cluster/Docker Cluster/Domain Domain/VaultSql; do
             timeout --kill-after=15s 12m pnpm test:integration "test/$suite.test.ts" --retry 0 --concurrency 1 \
               2>&1 | tee "$evidence/${suite//\//-}.log" || result=1
           done

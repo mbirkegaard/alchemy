@@ -55,7 +55,7 @@ const accepts = (host: string, port: number) =>
  * no longer accepts connections. A runner's check is shared by every request
  * to it for {@link RECHECK}.
  */
-const runnerClient = Layer.effect(
+export const runnerHttpClient = Layer.effect(
   HttpClient.HttpClient,
   Effect.gen(function* () {
     const client = yield* HttpClient.HttpClient;
@@ -91,14 +91,14 @@ const runnerClient = Layer.effect(
 /**
  * The runner's Effect Cluster over HTTP: `NodeClusterHttp.layer` with
  * `transport: "http"` and `storage: "byo"`, sending to other runners through
- * {@link runnerClient}.
+ * {@link runnerHttpClient}.
  */
 export const layer = (shardingConfig: Partial<ShardingConfig.ShardingConfig["Service"]>) => {
   const clientProtocol = HttpRunner.layerClientProtocolHttpDefault.pipe(
-    Layer.provide(runnerClient),
+    Layer.provide(runnerHttpClient),
   );
   return HttpRunner.layerHttp.pipe(
-    Layer.provide([NodeClusterHttp.layerHttpServer, runnerClient]),
+    Layer.provide([NodeClusterHttp.layerHttpServer, runnerHttpClient]),
     Layer.provide(
       RunnerHealth.layerPing.pipe(Layer.provide(Runners.layerRpc), Layer.provide(clientProtocol)),
     ),
@@ -106,3 +106,17 @@ export const layer = (shardingConfig: Partial<ShardingConfig.ShardingConfig["Ser
     Layer.provide(RpcSerialization.layerSchemaBinary({})),
   );
 };
+
+/**
+ * A cluster client with no runner of its own (an external program's
+ * gateway): `NodeClusterHttp.layer` with `clientOnly` and `storage: "byo"`,
+ * sending to runners through {@link runnerHttpClient}.
+ */
+export const layerClientOnly = (
+  shardingConfig: Partial<ShardingConfig.ShardingConfig["Service"]>,
+) =>
+  HttpRunner.layerHttpClientOnly.pipe(
+    Layer.provide(runnerHttpClient),
+    Layer.provide(ShardingConfig.layerFromEnv(shardingConfig)),
+    Layer.provide(RpcSerialization.layerSchemaBinary({})),
+  );

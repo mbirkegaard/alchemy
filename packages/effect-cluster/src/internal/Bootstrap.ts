@@ -9,9 +9,8 @@
 import { spawn } from "node:child_process";
 import { createSocket } from "node:dgram";
 import { lookup } from "node:dns/promises";
-import { createServer } from "node:http";
 import { networkInterfaces } from "node:os";
-import { NodeClusterHttp, NodeCrypto, NodeHttpServer, NodeServices } from "@effect/platform-node";
+import { NodeCrypto, NodeServices } from "@effect/platform-node";
 import { PgClient } from "@effect/sql-pg";
 import { RuntimeConfigProviderLive } from "alchemy/Runtime";
 import {
@@ -59,7 +58,8 @@ import { PlatformDeclaration, type HostedEntity } from "../Entity.ts";
 import { RunnerHost } from "../Host.ts";
 import type { HostedSingleton } from "../Singleton.ts";
 import type { HostedWorkflow } from "../Workflow.ts";
-import { GATEWAY_PORT, RUNNER_PORT, gatewayLayer } from "./Gateway.ts";
+import { RUNNER_PORT, gatewayLayer } from "./Gateway.ts";
+import { gatewayHttpServer } from "./GatewayServer.ts";
 import { HasNoPool, type HostedRuntimeContext } from "./HostedRuntime.ts";
 import * as RunnerTransport from "./RunnerTransport.ts";
 
@@ -264,14 +264,22 @@ export const runExternal = (
           ? (value as HostedEntity["entity"])
           : EffectEntity.fromRpcGroup(name, value as RpcGroup.RpcGroup<Rpc.Any>),
       );
-      const cluster = NodeClusterHttp.layer({
-        transport: "http",
-        storage: "sql",
-        clientOnly: true,
-        shardingConfig: shardGroupsConfig(),
-      }).pipe(Layer.provide(clusterDatabase));
+      // Effect Cluster as a client, whose requests to a runner the platform
+      // removed fail fast and are routed again (see RunnerTransport).
+      const shardingConfig = shardGroupsConfig();
+      const cluster = RunnerTransport.layerClientOnly(shardingConfig).pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            SqlMessageStorage.layer.pipe(Layer.provide(NodeCrypto.layerDigest)),
+            Layer.orDie(SqlRunnerStorage.layer),
+          ).pipe(
+            Layer.provide(ShardingConfig.layerFromEnv(shardingConfig)),
+            Layer.provide(clusterDatabase),
+          ),
+        ),
+      );
       const gateway = gatewayLayer(entities, env("CLUSTER_GATEWAY_TOKEN") ?? "").pipe(
-        Layer.provide(gatewayServer),
+        Layer.provide(gatewayHttpServer()),
       );
       return yield* Effect.raceFirst(Layer.launch(gateway.pipe(Layer.provide(cluster))), exited);
     }).pipe(
@@ -413,18 +421,6 @@ const runnerHealthCheck = (group: string, self: RunnerAddress.RunnerAddress) =>
       );
     }),
   );
-
-/**
- * The HTTP server a runner's gateway listens on. Stopping, it lets requests
- * in flight finish for at most 2 seconds, not Node's 20: the runner holds its
- * shards until its gateway has stopped, and answers nothing on them in the
- * meantime, so one request left open through the gateway held the runner's
- * keys unanswered for 20 seconds.
- */
-const gatewayServer = NodeHttpServer.layer(createServer, {
-  port: GATEWAY_PORT,
-  gracefulShutdownTimeout: Duration.seconds(2),
-});
 
 /** The shard groups this pool serves, and every group in the cluster. */
 const shardGroupsConfig = () => {
@@ -580,7 +576,7 @@ export const bootstrap = (
       placed.map((entry) => entry.entity),
       env("CLUSTER_GATEWAY_TOKEN") ?? "",
       new Map(workflows.map((entry) => [entry.workflow._tag, entry.workflow])),
-    ).pipe(Layer.provide(gatewayServer));
+    ).pipe(Layer.provide(gatewayHttpServer()));
 
     yield* Effect.logInfo(
       `Effect Cluster runner ${host}:${RUNNER_PORT}: ${hosted

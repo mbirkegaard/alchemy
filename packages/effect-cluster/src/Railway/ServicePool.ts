@@ -54,9 +54,13 @@ export interface ServicePoolOptions extends PoolSettings {
  * private address, so replicas, and a deployment overlapping the one it
  * replaces, never share one. Railway stops a runner with SIGTERM on every
  * deploy, restart and scale; it hands its shards back and unregisters, so
- * the other runners take them within seconds. A runner that crashes leaves
- * the shard assignments at the next health check, every 5 seconds. With a
- * database elsewhere, the pool runs one runner under the Service's hostname.
+ * the other runners take them within seconds. Railway restarts a runner
+ * that crashes under the same address, and it takes its shards back; one
+ * that stays down loses them at the pool's next health check, every 5
+ * seconds, or once its registration expires (35 seconds) if it ran that
+ * check itself. Callers retry a request that couldn't reach the gateway
+ * while its hostname still lists a stopped runner. With a database
+ * elsewhere, the pool runs one runner under the Service's hostname.
  *
  * ### Running on Railway
  * **Example:** A pool beside its database

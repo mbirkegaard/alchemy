@@ -60,7 +60,7 @@ export const Default = ClusterRailway.ServicePool("Default", {
 }).pipe(Layer.provide(Database));
 ```
 
-Omit `replicas` to leave the count as it is, one when the Service is created. Changing it updates the Service in place: Railway starts one deployment that replaces every replica with the image it already built. Railway stops each old runner with `SIGTERM`, and it hands its shards back before it exits, so the new runners take them within seconds. A runner that crashes leaves the shard assignments at the next health check, which runs every 5 seconds, or sooner if Railway restarts it under the same address. Callers retry a request that couldn't reach a gateway, while its hostname still lists a runner that has stopped.
+Omit `replicas` to leave the count as it is, one when the Service is created. Changing it updates the Service in place: Railway starts one deployment that replaces every replica with the image it already built. Railway stops each old runner with `SIGTERM`, and it hands its shards back before it exits, so the new runners take them within seconds. Railway restarts a runner that crashes under the same address, and it takes its shards back within a few seconds. A runner that stays down loses its shards at the pool's next health check, which runs every 5 seconds, or when its registration expires after 35 seconds if it was the runner running that check. Callers retry a request that couldn't reach a gateway, while its hostname still lists a runner that has stopped.
 
 `Cluster.Database.fromUrl` does not tell the pool where to run. Pass `project` to the pool, and pass `environment` if you are not using the project's primary environment. A pool on such a database runs one runner under its Service's hostname, and doesn't take `replicas`.
 

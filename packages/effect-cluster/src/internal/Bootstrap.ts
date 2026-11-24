@@ -156,7 +156,7 @@ const strictPeerAddress = (peers: string, local: ReadonlyArray<string>) =>
         ? Effect.fail(new RunnerAddressNotFound({ peers, resolved, local }))
         : Effect.as(
             Effect.logInfo(
-              `Effect Cluster runner address ${mine[0]}: ${peers} resolved [${resolved.join(", ")}]${
+              `Effect Cluster runner address ${mine[0]}: ${peers} resolved [${resolved.join(", ")}], own [${local.join(", ")}]${
                 env("RAILWAY_REPLICA_ID") ? `, replica ${env("RAILWAY_REPLICA_ID")}` : ""
               }`,
             ),

@@ -7,6 +7,7 @@
  * @internal
  */
 import { spawn } from "node:child_process";
+import { createSocket } from "node:dgram";
 import { lookup } from "node:dns/promises";
 import { createServer } from "node:http";
 import { networkInterfaces } from "node:os";
@@ -75,9 +76,10 @@ const inIpv4Range = (address: string, range: string) => {
 
 /**
  * The address other runners reach this one at: an explicit
- * `CLUSTER_RUNNER_HOST`, else the local address that
- * `CLUSTER_PEERS` (a DNS name every runner resolves to) lists,
- * else the first non-internal IPv4 address.
+ * `CLUSTER_RUNNER_HOST`, else with `CLUSTER_RUNNER_ROUTE=database` the
+ * local address its route to the database leaves from, else the local
+ * address that `CLUSTER_PEERS` (a DNS name every runner resolves to)
+ * lists, else the first non-internal IPv4 address.
  */
 const runnerHost = Effect.gen(function* () {
   const explicit = env("CLUSTER_RUNNER_HOST");
@@ -88,6 +90,9 @@ const runnerHost = Effect.gen(function* () {
     .map((iface) => iface!.address)
     // Link-local addresses (an agent's, a metadata endpoint's) aren't reachable.
     .filter((address) => !address.startsWith("169.254.") && !address.startsWith("fe80:"));
+  // Replicas that share a hostname: the address this runner reaches the
+  // cluster's database from, on the private network they share.
+  if (env("CLUSTER_RUNNER_ROUTE") === "database") return yield* routedAddress(local);
   // On a private network with a known range, the address in it.
   const range = env("CLUSTER_RUNNER_NETWORK");
   if (range) {
@@ -113,60 +118,84 @@ const runnerHost = Effect.gen(function* () {
     if (address) return address;
   }
   const peers = env("CLUSTER_PEERS");
-  if (peers && env("CLUSTER_PEERS_STRICT") === "1") return yield* strictPeerAddress(peers, local);
   if (peers) {
-    const mine = (yield* resolvePeers(peers)).find((address) => local.includes(address));
+    const resolved = yield* Effect.tryPromise(() => lookup(peers, { all: true })).pipe(
+      Effect.map((addresses) => addresses.map((address) => address.address)),
+      Effect.orElseSucceed((): string[] => []),
+    );
+    const mine = resolved.find((address) => local.includes(address));
     if (mine) return mine;
   }
   return local.find((address) => !address.includes(":")) ?? "127.0.0.1";
 });
 
-/** Every address `peers` resolves to, none when it doesn't. */
-const resolvePeers = (peers: string) =>
-  Effect.tryPromise(() => lookup(peers, { all: true })).pipe(
-    Effect.map((addresses) => addresses.map((address) => address.address)),
-    Effect.orElseSucceed((): string[] => []),
-  );
-
-/** No address `CLUSTER_PEERS` resolved to is one of this runner's own. */
+/** This runner has no address of its own on the route to its database. */
 export class RunnerAddressNotFound extends Data.TaggedError("Cluster.RunnerAddressNotFound")<{
-  readonly peers: string;
-  readonly resolved: ReadonlyArray<string>;
-  readonly local: ReadonlyArray<string>;
+  readonly route: string;
+  readonly reason: string;
 }> {
   override get message() {
-    return `None of ${this.peers}'s addresses [${this.resolved.join(", ")}] is this runner's own [${this.local.join(", ")}].`;
+    return `No address of this runner's routes to ${this.route}: ${this.reason}`;
   }
 }
 
 /**
- * This runner's own address among those `peers` resolves to, waiting a
- * bounded while for its name to list it; never a guess from interface order.
- * IPv6 first, as a private network that has both always has it.
+ * The local address the kernel picks to reach the cluster database's host,
+ * IPv6 first: the one interface on the private network the database is on,
+ * whatever order the interfaces are in. Connecting a UDP socket sends
+ * nothing. Waits a bounded while for the host to resolve.
  */
-const strictPeerAddress = (peers: string, local: ReadonlyArray<string>) =>
-  resolvePeers(peers).pipe(
-    Effect.flatMap((resolved) => {
-      const mine = resolved
-        .filter((address) => local.includes(address))
-        .toSorted(
-          (a, b) => Number(!a.includes(":")) - Number(!b.includes(":")) || a.localeCompare(b),
-        );
-      return mine[0] === undefined
-        ? Effect.fail(new RunnerAddressNotFound({ peers, resolved, local }))
-        : Effect.as(
-            Effect.logInfo(
-              `Effect Cluster runner address ${mine[0]}: ${peers} resolved [${resolved.join(", ")}], own [${local.join(", ")}]${
-                env("RAILWAY_REPLICA_ID") ? `, replica ${env("RAILWAY_REPLICA_ID")}` : ""
-              }`,
-            ),
-            mine[0],
-          );
-    }),
+const routedAddress = (local: ReadonlyArray<string>) => {
+  const route = urlHost(env("CLUSTER_DATABASE_URL") ?? env("DATABASE_URL") ?? "");
+  /** The local address a datagram to `target` would leave from. */
+  const source = (target: { address: string; family: number }) => {
+    const socket = createSocket(target.family === 6 ? "udp6" : "udp4");
+    return new Promise<string>((resolve, reject) => {
+      socket.once("error", reject);
+      socket.connect(9, target.address, () => resolve(socket.address().address));
+    }).finally(() => socket.close());
+  };
+  return Effect.tryPromise({
+    try: async () => {
+      const targets = (await lookup(route, { all: true })).toSorted((a, b) => b.family - a.family);
+      const tried: string[] = [];
+      for (const target of targets) {
+        const from = await source(target).catch(() => undefined);
+        if (from !== undefined && local.includes(from)) return { target: target.address, from };
+        tried.push(`${target.address} from ${from ?? "nowhere"}`);
+      }
+      throw new Error(
+        `no route leaves from [${local.join(", ")}] (${tried.join("; ") || "unresolved"})`,
+      );
+    },
+    catch: (cause) =>
+      new RunnerAddressNotFound({
+        route,
+        reason: cause instanceof Error ? cause.message : String(cause),
+      }),
+  }).pipe(
+    Effect.tap(({ target, from }) =>
+      Effect.logInfo(
+        `Effect Cluster runner address ${from}: routes to ${route} (${target}); own [${local.join(", ")}]${
+          env("RAILWAY_REPLICA_ID") ? `, replica ${env("RAILWAY_REPLICA_ID")}` : ""
+        }`,
+      ),
+    ),
+    Effect.map(({ from }) => from),
     Effect.tapError((error) => Effect.logWarning(error.message)),
     Effect.retry({ schedule: Schedule.spaced("2 seconds"), times: 30 }),
     Effect.orDie,
   );
+};
+
+/** A URL's host, never its credentials. */
+const urlHost = (url: string) => {
+  try {
+    return new URL(url).hostname.replace(/^\[(.*)\]$/, "$1");
+  } catch {
+    return "";
+  }
+};
 
 /**
  * Run an existing Effect Cluster program as it is, as its own process, with

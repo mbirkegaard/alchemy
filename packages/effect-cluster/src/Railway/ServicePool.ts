@@ -6,7 +6,7 @@ import * as Effect from "effect/Effect";
 import type * as Layer from "effect/Layer";
 import type { Database } from "../Database.ts";
 import { GATEWAY_PORT } from "../internal/Gateway.ts";
-import { makePoolLayer, type PoolSettings } from "../internal/PoolHost.ts";
+import { DatabaseNetworkMismatch, makePoolLayer, type PoolSettings } from "../internal/PoolHost.ts";
 import type { PoolHost } from "../internal/PoolHostService.ts";
 import type { Providers } from "../Providers.ts";
 
@@ -28,9 +28,10 @@ export interface ServicePoolOptions extends PoolSettings {
   environment?: Input<Railway.ServiceProps["environment"]>;
   /**
    * Number of runners, as replicas of the one Railway Service. Each
-   * registers under its own private address, the one the Service's
-   * private hostname lists for it, so they serve one shard group; the
-   * hostname stays the gateway callers reach. Setting it, even to 1, also
+   * registers under its own private address, the one it reaches the
+   * database from, so they serve one shard group; the Service's private
+   * hostname stays the gateway callers reach. Needs the database on the
+   * project's private network (`ClusterRailway.Database`). Setting it, even to 1, also
    * keeps an overlapping deployment's runner distinct from the one it
    * replaces.
    * @default one runner, registered under the Service's private hostname
@@ -97,32 +98,42 @@ export const ServicePool = (
     // it would render empty. The Service is created with this name, which is
     // its private hostname.
     gateway: (name) => Effect.succeed({ url: `http://${name}.railway.internal:${GATEWAY_PORT}` }),
-    nodes: ({ network, name, program, environment }) =>
-      Railway.Service(`${id}Pool`, {
-        project: network.project as Input<Railway.ServiceProps["project"]>,
-        ...(network.environment === undefined
-          ? {}
-          : { environment: network.environment as Input<Railway.ServiceProps["environment"]> }),
-        name,
-        // The bundled runner and its Dockerfile, uploaded as the build context.
-        context: program.pipe(Output.map((p) => p.dir)),
-        port: GATEWAY_PORT,
-        healthcheck: "/health",
-        publicDomain: false,
-        ...(options.region === undefined ? {} : { region: options.region }),
-        ...(options.replicas === undefined ? {} : { replicas: options.replicas }),
-        env: environment.pipe(
-          Output.map((env) => ({
-            ...env,
-            // Railway's private network is IPv6: listen on every address.
-            CLUSTER_LISTEN_HOST: "::",
-            ...(options.replicas === undefined
-              ? // One runner registers under the hostname the others resolve.
-                { CLUSTER_RUNNER_HOST: "${{RAILWAY_PRIVATE_DOMAIN}}" }
-              : // Every replica shares that hostname: each registers under
-                // its own address among those it lists, or fails to start.
-                { CLUSTER_PEERS: "${{RAILWAY_PRIVATE_DOMAIN}}", CLUSTER_PEERS_STRICT: "1" }),
-          })),
-        ),
-      }).pipe(Effect.asVoid),
+    nodes: ({ database, network, name, program, environment }) =>
+      // Replicas find their own address by their route to the database,
+      // which only names the private network when the database is on it.
+      options.replicas !== undefined && database.network?.kind !== "railway"
+        ? Effect.die(
+            new DatabaseNetworkMismatch({
+              message:
+                "ClusterRailway.ServicePool runs `replicas` beside a database on the project's private network (ClusterRailway.Database).",
+            }),
+          )
+        : Railway.Service(`${id}Pool`, {
+            project: network.project as Input<Railway.ServiceProps["project"]>,
+            ...(network.environment === undefined
+              ? {}
+              : { environment: network.environment as Input<Railway.ServiceProps["environment"]> }),
+            name,
+            // The bundled runner and its Dockerfile, uploaded as the build context.
+            context: program.pipe(Output.map((p) => p.dir)),
+            port: GATEWAY_PORT,
+            healthcheck: "/health",
+            publicDomain: false,
+            ...(options.region === undefined ? {} : { region: options.region }),
+            ...(options.replicas === undefined ? {} : { replicas: options.replicas }),
+            env: environment.pipe(
+              Output.map((env) => ({
+                ...env,
+                // Railway's private network is IPv6: listen on every address.
+                CLUSTER_LISTEN_HOST: "::",
+                ...(options.replicas === undefined
+                  ? // One runner registers under the hostname the others resolve.
+                    { CLUSTER_RUNNER_HOST: "${{RAILWAY_PRIVATE_DOMAIN}}" }
+                  : // Every replica shares that hostname, which lists none of
+                    // them until their deployment is live: each registers under
+                    // its own private address, the one it reaches the database from.
+                    { CLUSTER_RUNNER_ROUTE: "database" }),
+              })),
+            ),
+          }).pipe(Effect.asVoid),
   });

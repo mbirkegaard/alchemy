@@ -271,7 +271,7 @@ export const runExternal = (
         shardingConfig: shardGroupsConfig(),
       }).pipe(Layer.provide(clusterDatabase));
       const gateway = gatewayLayer(entities, env("CLUSTER_GATEWAY_TOKEN") ?? "").pipe(
-        Layer.provide(NodeHttpServer.layer(createServer, { port: GATEWAY_PORT })),
+        Layer.provide(gatewayServer),
       );
       return yield* Effect.raceFirst(Layer.launch(gateway.pipe(Layer.provide(cluster))), exited);
     }).pipe(
@@ -413,6 +413,18 @@ const runnerHealthCheck = (group: string, self: RunnerAddress.RunnerAddress) =>
       );
     }),
   );
+
+/**
+ * The HTTP server a runner's gateway listens on. Stopping, it lets requests
+ * in flight finish for at most 2 seconds, not Node's 20: the runner holds its
+ * shards until its gateway has stopped, and answers nothing on them in the
+ * meantime, so one request left open through the gateway held the runner's
+ * keys unanswered for 20 seconds.
+ */
+const gatewayServer = NodeHttpServer.layer(createServer, {
+  port: GATEWAY_PORT,
+  gracefulShutdownTimeout: Duration.seconds(2),
+});
 
 /** The shard groups this pool serves, and every group in the cluster. */
 const shardGroupsConfig = () => {
@@ -568,7 +580,7 @@ export const bootstrap = (
       placed.map((entry) => entry.entity),
       env("CLUSTER_GATEWAY_TOKEN") ?? "",
       new Map(workflows.map((entry) => [entry.workflow._tag, entry.workflow])),
-    ).pipe(Layer.provide(NodeHttpServer.layer(createServer, { port: GATEWAY_PORT })));
+    ).pipe(Layer.provide(gatewayServer));
 
     yield* Effect.logInfo(
       `Effect Cluster runner ${host}:${RUNNER_PORT}: ${hosted

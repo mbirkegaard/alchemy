@@ -44,6 +44,11 @@ jobs:
           install: true
           require-lockfile: true
 
+      - name: Use IPv4 for localhost on the disposable runner
+        run: |
+          sudo sed -Ei '/^[[:space:]]*::1[[:space:]]/s/[[:space:]]+localhost([[:space:]]|$)/\1/' /etc/hosts
+          getent ahosts localhost
+
       - name: Check runner-local Swarm ingress
         run: |
           ip -4 route

@@ -110,6 +110,9 @@ describe(
         );
         const network = yield* stack.deploy(resource);
         expect(network.driver).toBe("overlay");
+        // Recorded once the swarm allocated it, not as just created: a
+        // network recorded with no driver was replaced on the next deploy.
+        expect(network.ipam.config.length).toBeGreaterThan(0);
         expect(network.name.length).toBeLessThanOrEqual(63);
         const info = yield* docker.network.inspect(network.id);
         expect(info.Driver).toBe("overlay");

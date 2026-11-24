@@ -293,7 +293,7 @@ export const NetworkProvider = () =>
             output.driver !== args.driver ||
             (output.internal ?? false) !== (args.internal ?? false) ||
             (output.attachable ?? false) !== (args.attachable ?? false) ||
-            (output.enableIPv4 ?? true) !== (args.ipv4 ?? true) ||
+            allocatesIPv4(output.driver, output.enableIPv4) !== (args.ipv4 ?? true) ||
             output.enableIPv6 !== args.ipv6 ||
             !matchesOptions(output.driverOpts ?? {}, args.opt ?? {}) ||
             hasRemovedOptions(olds?.driverOpts, news?.driverOpts) ||
@@ -567,13 +567,23 @@ const matchesIpam = (
   return true;
 };
 
+/**
+ * Whether a network allocates IPv4 addresses. Swarm has no setting for it, so
+ * an overlay network always does, but Docker before 28.3 reports
+ * `EnableIPv4: false` for one (moby/moby@6bac5ca), and so does the state of
+ * one deployed on it. Read as reported, every redeploy replaced the network,
+ * which fails while services use it.
+ */
+const allocatesIPv4 = (driver: string, enableIPv4: boolean | undefined) =>
+  driver === "overlay" || (enableIPv4 ?? true);
+
 export const toNetworkAttributes = (info: Docker.Network): Network["Attributes"] => ({
   id: info.Id,
   name: info.Name,
   driver: info.Driver,
   internal: info.Internal ?? false,
   attachable: info.Attachable ?? false,
-  enableIPv4: info.EnableIPv4 ?? true,
+  enableIPv4: allocatesIPv4(info.Driver, info.EnableIPv4),
   enableIPv6: info.EnableIPv6,
   driverOpts: info.Options ?? {},
   ipam: {

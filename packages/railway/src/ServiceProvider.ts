@@ -1259,6 +1259,7 @@ export const ServiceProvider = () =>
               region: props.region,
               legacy: instance?.region,
               fallbackReplicas: instance?.numReplicas,
+              replicas: props.replicas,
             });
           let region = yield* placeRegion();
 

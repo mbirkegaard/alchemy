@@ -77,6 +77,12 @@ export interface ServiceProps extends PlatformProps {
    */
   region?: string;
   /**
+   * How many replicas run, all in `region` (or the service's current
+   * region). They share the service's private hostname. Omit this to leave
+   * the count alone (one on first create).
+   */
+  replicas?: number;
+  /**
    * Port the process listens on. Written to `PORT` and used as the
    * generated `*.up.railway.app` `targetPort`. Default is `3000` for
    * Effect-native (`main`) Services. Pass `5678` for

@@ -66,6 +66,20 @@ describe(
       ).toBeUndefined();
     });
 
+    it("sets a requested replica count, and leaves one already running it", () => {
+      const placement = { "us-west2": { numReplicas: 1 } };
+      expect(regionPlacementPatch("us-west2", placement, undefined, 3)).toEqual({
+        "us-west2": { numReplicas: 3 },
+      });
+      expect(
+        regionPlacementPatch("us-west2", { "us-west2": { numReplicas: 3 } }, undefined, 3),
+      ).toBeUndefined();
+      expect(regionPlacementPatch("europe-west4-drams3a", placement, undefined, 2)).toEqual({
+        "europe-west4-drams3a": { numReplicas: 2 },
+        "us-west2": null,
+      });
+    });
+
     it("uses the legacy replica count when placement is empty", () => {
       expect(regionPlacementPatch("us-west2", {}, 4)).toEqual({
         "us-west2": { numReplicas: 4 },

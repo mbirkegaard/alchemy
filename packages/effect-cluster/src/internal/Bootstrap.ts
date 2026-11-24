@@ -40,6 +40,7 @@ import * as Path from "effect/Path";
 import * as Redacted from "effect/Redacted";
 import * as Ref from "effect/Ref";
 import type { Rpc, RpcGroup } from "effect/rpc";
+import * as Schedule from "effect/Schedule";
 import type { Workflow as EffectWorkflow } from "effect/workflow";
 import type { HostedCron } from "../Cron.ts";
 import { databaseMaxConnections } from "../Database.ts";
@@ -112,16 +113,60 @@ const runnerHost = Effect.gen(function* () {
     if (address) return address;
   }
   const peers = env("CLUSTER_PEERS");
+  if (peers && env("CLUSTER_PEERS_STRICT") === "1") return yield* strictPeerAddress(peers, local);
   if (peers) {
-    const resolved = yield* Effect.tryPromise(() => lookup(peers, { all: true })).pipe(
-      Effect.map((addresses) => addresses.map((address) => address.address)),
-      Effect.orElseSucceed((): string[] => []),
-    );
-    const mine = resolved.find((address) => local.includes(address));
+    const mine = (yield* resolvePeers(peers)).find((address) => local.includes(address));
     if (mine) return mine;
   }
   return local.find((address) => !address.includes(":")) ?? "127.0.0.1";
 });
+
+/** Every address `peers` resolves to, none when it doesn't. */
+const resolvePeers = (peers: string) =>
+  Effect.tryPromise(() => lookup(peers, { all: true })).pipe(
+    Effect.map((addresses) => addresses.map((address) => address.address)),
+    Effect.orElseSucceed((): string[] => []),
+  );
+
+/** No address `CLUSTER_PEERS` resolved to is one of this runner's own. */
+export class RunnerAddressNotFound extends Data.TaggedError("Cluster.RunnerAddressNotFound")<{
+  readonly peers: string;
+  readonly resolved: ReadonlyArray<string>;
+  readonly local: ReadonlyArray<string>;
+}> {
+  override get message() {
+    return `None of ${this.peers}'s addresses [${this.resolved.join(", ")}] is this runner's own [${this.local.join(", ")}].`;
+  }
+}
+
+/**
+ * This runner's own address among those `peers` resolves to, waiting a
+ * bounded while for its name to list it; never a guess from interface order.
+ * IPv6 first, as a private network that has both always has it.
+ */
+const strictPeerAddress = (peers: string, local: ReadonlyArray<string>) =>
+  resolvePeers(peers).pipe(
+    Effect.flatMap((resolved) => {
+      const mine = resolved
+        .filter((address) => local.includes(address))
+        .toSorted(
+          (a, b) => Number(!a.includes(":")) - Number(!b.includes(":")) || a.localeCompare(b),
+        );
+      return mine[0] === undefined
+        ? Effect.fail(new RunnerAddressNotFound({ peers, resolved, local }))
+        : Effect.as(
+            Effect.logInfo(
+              `Effect Cluster runner address ${mine[0]}: ${peers} resolved [${resolved.join(", ")}]${
+                env("RAILWAY_REPLICA_ID") ? `, replica ${env("RAILWAY_REPLICA_ID")}` : ""
+              }`,
+            ),
+            mine[0],
+          );
+    }),
+    Effect.tapError((error) => Effect.logWarning(error.message)),
+    Effect.retry({ schedule: Schedule.spaced("2 seconds"), times: 30 }),
+    Effect.orDie,
+  );
 
 /**
  * Run an existing Effect Cluster program as it is, as its own process, with

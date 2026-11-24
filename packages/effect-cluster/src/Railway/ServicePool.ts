@@ -26,6 +26,16 @@ export interface ServicePoolOptions extends PoolSettings {
    * @default the project's primary environment
    */
   environment?: Input<Railway.ServiceProps["environment"]>;
+  /**
+   * Number of runners, as replicas of the one Railway Service. Each
+   * registers under its own private address, the one the Service's
+   * private hostname lists for it, so they serve one shard group; the
+   * hostname stays the gateway callers reach. Setting it, even to 1, also
+   * keeps an overlapping deployment's runner distinct from the one it
+   * replaces.
+   * @default one runner, registered under the Service's private hostname
+   */
+  replicas?: number;
 }
 
 /**
@@ -36,8 +46,10 @@ export interface ServicePoolOptions extends PoolSettings {
  * its gateway too: the gateway has no public domain. With a database in no
  * Railway project (`Cluster.Database.fromUrl`), give the pool its `project`.
  *
- * Railway gives every replica of a Service the same private hostname, so the
- * pool runs one runner. For more runners, declare more pools.
+ * Railway gives every replica of a Service the same private hostname, so by
+ * default the pool runs one runner under it. With `replicas`, each replica
+ * registers under its own private address instead, and they share the
+ * pool's shard group.
  *
  * ### Running on Railway
  * **Example:** A pool beside its database
@@ -98,13 +110,18 @@ export const ServicePool = (
         healthcheck: "/health",
         publicDomain: false,
         ...(options.region === undefined ? {} : { region: options.region }),
+        ...(options.replicas === undefined ? {} : { replicas: options.replicas }),
         env: environment.pipe(
           Output.map((env) => ({
             ...env,
-            // Railway's private network is IPv6: listen on every address,
-            // and register under the hostname the other runners resolve.
+            // Railway's private network is IPv6: listen on every address.
             CLUSTER_LISTEN_HOST: "::",
-            CLUSTER_RUNNER_HOST: "${{RAILWAY_PRIVATE_DOMAIN}}",
+            ...(options.replicas === undefined
+              ? // One runner registers under the hostname the others resolve.
+                { CLUSTER_RUNNER_HOST: "${{RAILWAY_PRIVATE_DOMAIN}}" }
+              : // Every replica shares that hostname: each registers under
+                // its own address among those it lists, or fails to start.
+                { CLUSTER_PEERS: "${{RAILWAY_PRIVATE_DOMAIN}}", CLUSTER_PEERS_STRICT: "1" }),
           })),
         ),
       }).pipe(Effect.asVoid),

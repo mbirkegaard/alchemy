@@ -46,12 +46,21 @@ jobs:
 
       - name: Check runner-local Swarm ingress
         run: |
-          docker swarm init --advertise-addr 127.0.0.1
+          ip -4 route
+          node_ip=$(ip -4 route get 1.1.1.1 | awk '{for (i=1;i<NF;i++) if ($i=="src") {print $(i+1); exit}}')
+          test -n "$node_ip"
+          docker swarm init --advertise-addr "$node_ip" --default-addr-pool 172.30.0.0/16 --default-addr-pool-mask-length 24
           trap 'docker service rm ci-ingress-check' EXIT
           docker service create --name ci-ingress-check --publish 18080:8080 busybox:1.37 sh -c 'mkdir /www && echo ready >/www/index.html && httpd -f -p 8080 -h /www'
           docker service ps --no-trunc ci-ingress-check
-          curl --noproxy '*' --fail --retry 10 --retry-all-errors --retry-delay 2 --max-time 3 http://localhost:18080/
-          curl --noproxy '*' --fail --max-time 3 http://127.0.0.1:18080/
+          task=$(docker ps -q --filter label=com.docker.swarm.service.name=ci-ingress-check)
+          docker exec "$task" wget -qO- http://127.0.0.1:8080/
+          result=0
+          for address in 127.0.0.1 "$node_ip" localhost; do
+            echo "Checking ingress via $address"
+            curl --noproxy '*' --fail --retry 2 --retry-all-errors --retry-delay 2 --max-time 3 "http://$address:18080/" || result=1
+          done
+          exit "$result"
 
       - name: Run Docker and Domain separately and capture failed stack diagnostics
         run: |

@@ -375,13 +375,19 @@ const runnerHealthCheck = (group: string, self: RunnerAddress.RunnerAddress) =>
       const isAlive = (address: RunnerAddress.RunnerAddress) =>
         key(address) === key(self)
           ? Effect.succeed(true)
-          : runners
-              .ping(address)
-              .pipe(
-                Effect.timeout("3 seconds"),
-                Effect.retry({ schedule: Schedule.spaced("500 millis"), times: 3 }),
-                Effect.isSuccess,
-              );
+          : runners.ping(address).pipe(
+              Effect.timeout("3 seconds"),
+              // A runner too busy to answer in time still accepts a TCP
+              // connection at once, so only then is it pinged again. One that
+              // doesn't is gone: a SIGKILLed Swarm task's address drops
+              // packets, and four pings of it took 13.5 s.
+              Effect.retry({
+                schedule: Schedule.spaced("500 millis"),
+                times: 3,
+                while: () => RunnerTransport.accepts(address.host, address.port),
+              }),
+              Effect.isSuccess,
+            );
       /** Mark every runner of the pool by whether it answers. */
       const checkAll = (
         registered: ReadonlyArray<readonly [Runner.Runner, boolean]>,

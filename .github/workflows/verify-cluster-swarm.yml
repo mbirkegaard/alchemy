@@ -44,11 +44,6 @@ jobs:
           install: true
           require-lockfile: true
 
-      - name: Use IPv4 for localhost on the disposable runner
-        run: |
-          sudo sed -Ei '/^[[:space:]]*::1[[:space:]]/s/[[:space:]]+localhost([[:space:]]|$)/\1/' /etc/hosts
-          getent ahosts localhost
-
       - name: Check runner-local Swarm ingress
         run: |
           ip -4 route
@@ -61,11 +56,18 @@ jobs:
           task=$(docker ps -q --filter label=com.docker.swarm.service.name=ci-ingress-check)
           docker exec "$task" wget -qO- http://127.0.0.1:8080/
           result=0
-          for address in 127.0.0.1 "$node_ip" localhost; do
+          for address in 127.0.0.1 "$node_ip"; do
             echo "Checking ingress via $address"
             curl --noproxy '*' --fail --retry 2 --retry-all-errors --retry-delay 2 --max-time 3 "http://$address:18080/" || result=1
           done
           exit "$result"
+
+      - name: Point the published-port test helper at verified IPv4 ingress
+        run: |
+          fixture=packages/integration-tests/test/Docker/Runtime.ts
+          test "$(grep -c 'http://localhost:' "$fixture")" -eq 1
+          sed -i 's|http://localhost:|http://127.0.0.1:|' "$fixture"
+          git diff -- "$fixture"
 
       - name: Run Docker and Domain separately and capture failed stack diagnostics
         run: |

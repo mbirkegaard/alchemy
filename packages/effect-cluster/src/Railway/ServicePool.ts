@@ -156,10 +156,6 @@ export const ServicePool = (
                   // restart and scale: it hands its shards back and
                   // unregisters, so the others take them at once.
                   CLUSTER_SHUTDOWN_TIMEOUT_MS: String((RUNNER_DRAINING_SECONDS - 5) * 1000),
-                  // Effect Cluster's own setting: check the other runners
-                  // every 5 s, so one that crashed leaves the assignments
-                  // within seconds, not when its registration expires.
-                  RUNNER_HEALTH_CHECK_INTERVAL: "5 seconds",
                 }
               : {
                   // The one runner registers under the hostname the others resolve.

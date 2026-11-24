@@ -102,15 +102,21 @@ describe(
         const docker = yield* Docker.Docker;
         yield* ensureDockerSwarm;
         yield* stack.destroy();
-        const network = yield* stack.deploy(
-          Docker.Network("an-overlay-network-with-a-rather-long-logical-identifier", {
+        const resource = Docker.Network(
+          "an-overlay-network-with-a-rather-long-logical-identifier",
+          {
             driver: "overlay",
-          }),
+          },
         );
+        const network = yield* stack.deploy(resource);
         expect(network.driver).toBe("overlay");
         expect(network.name.length).toBeLessThanOrEqual(63);
         const info = yield* docker.network.inspect(network.id);
         expect(info.Driver).toBe("overlay");
+        // Unchanged, it stays the same network: Docker before 28.3 reports an
+        // overlay network's IPv4 off, which a redeploy read as a change.
+        expect(network.enableIPv4).toBe(true);
+        expect((yield* stack.deploy(resource)).id).toBe(network.id);
         yield* stack.destroy();
       }),
     );

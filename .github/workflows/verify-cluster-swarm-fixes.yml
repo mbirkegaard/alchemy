@@ -1,0 +1,97 @@
+name: Compare Swarm recovery fixes
+
+on:
+  push:
+    branches: [test/verify-cluster-swarm-fixes]
+
+permissions:
+  contents: read
+
+jobs:
+  swarm:
+    name: Swarm (${{ matrix.variant }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 48
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: baseline
+            sha: d2ca3de15e2c6cb8406a8d6f3166d48314e9bcce
+          - variant: network-and-single-ping
+            sha: 6ac9842025b3ae4d73442da061860f3ba5aa8882
+          - variant: all-fixes
+            sha: f0469e8f2e1e9198d0c2911c654c029ece86e7f1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - name: Verify checkout and prepare SDKs
+        env:
+          TEST_SHA: ${{ matrix.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$TEST_SHA"
+          git log -1 --oneline
+          docker version --format 'client {{.Client.Version}} server {{.Server.Version}}'
+          git submodule update --init --depth=1 --checkout -- submodules/distilled
+      - uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
+        with:
+          install: true
+          require-lockfile: true
+      - name: Initialize Swarm and use IPv4 in test helper
+        run: |
+          node_ip=$(ip -4 route get 1.1.1.1 | awk '{for (i=1;i<NF;i++) if ($i=="src") {print $(i+1); exit}}')
+          test -n "$node_ip"
+          docker swarm init --advertise-addr "$node_ip" --default-addr-pool 172.30.0.0/16 --default-addr-pool-mask-length 24
+          fixture=packages/integration-tests/test/Docker/Runtime.ts
+          test "$(grep -c 'http://localhost:' "$fixture")" -eq 1
+          sed -i 's|http://localhost:|http://127.0.0.1:|' "$fixture"
+          git diff --check
+          git diff --stat
+      - name: Run suites and collect runner diagnostics
+        shell: bash
+        run: |
+          evidence="$RUNNER_TEMP/swarm-evidence"
+          mkdir -p "$evidence"
+          docker events --filter event=kill --filter event=die --filter event=start \
+            --format '{{.TimeNano}} {{.Action}} {{.Actor.ID}} {{index .Actor.Attributes "com.docker.swarm.service.name"}}' > "$evidence/events.log" 2>&1 &
+          events=$!
+          (
+            while true; do
+              for service in $(docker service ls --filter label=alchemy::id=DomainPoolPool -q); do
+                if [ ! -e "$evidence/$service.log" ]; then
+                  docker service logs --follow --timestamps --raw "$service" > "$evidence/$service.log" 2>&1 &
+                fi
+              done
+              sleep 2
+            done
+          ) &
+          observer=$!
+          trap 'kill "$observer" "$events" 2>/dev/null || true' EXIT
+          result=0
+          for suite in Docker/Network Cluster/Docker Cluster/Domain; do
+            timeout --kill-after=15s 12m pnpm test:integration "test/$suite.test.ts" --retry 0 --concurrency 1 \
+              2>&1 | tee "$evidence/${suite//\//-}.log" || result=1
+          done
+          for round in 1 2; do
+            timeout --kill-after=15s 4m pnpm test:integration test/Cluster/Domain.test.ts \
+              -t "a killed runner's keys answer again" --retry 0 --concurrency 1 \
+              2>&1 | tee "$evidence/crash-$round.log" || result=1
+            grep -Eq 'Tests: 0 failed \| 1 passed' "$evidence/crash-$round.log" || result=1
+          done
+          grep -hE 'Tests:|every key answered|is unreachable' "$evidence"/*.log || true
+          exit "$result"
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: swarm-evidence-${{ matrix.variant }}
+          path: ${{ runner.temp }}/swarm-evidence/
+          retention-days: 7
+      - name: Leave runner-local Swarm
+        if: always()
+        run: |
+          if [ "$(docker info --format '{{.Swarm.LocalNodeState}}')" = active ]; then
+            docker swarm leave --force
+          fi

@@ -16,7 +16,9 @@ export const Project = Railway.Project("App");
 
 export const Database = ClusterRailway.Database("Cluster", { project: Project });
 
-export const Default = ClusterRailway.ServicePool("Default").pipe(Layer.provide(Database));
+export const Default = ClusterRailway.ServicePool("Default", { replicas: 3 }).pipe(
+  Layer.provide(Database),
+);
 ```
 
 Install `@alchemy.run/railway` and finish [Railway setup](/railway/setup).
@@ -26,10 +28,10 @@ Install `@alchemy.run/railway` and finish [Railway setup](/railway/setup).
     { id: "project", label: "Railway project", type: "your project" },
     { id: "env", label: "environment", type: "private network *.railway.internal", parent: "project", dashed: true },
     { id: "db", label: "Database", type: "Railway Postgres", parent: "env", specs: [["data", "volume"]] },
-    { id: "pool", label: "Default", type: "Railway Service · one runner", parent: "env" },
+    { id: "pool", label: "Default", type: "Railway Service", parent: "env", specs: [["replicas", "3"]] },
     { id: "api", label: "Api", type: "Railway Service", parent: "env" },
   ]}
-  caption="The runner reaches Postgres over the private network, and callers in the environment reach the runner's gateway there. Neither has a public endpoint."
+  caption="The runners reach Postgres over the private network, and callers in the environment reach their gateway there. Neither has a public endpoint."
 />
 
 ## The database
@@ -49,15 +51,18 @@ export const Database = ClusterRailway.Database("Cluster", {
 
 ## The pool
 
-`ClusterRailway.ServicePool` runs one Railway Service, built from the bundled runner program, in the database's environment. Railway gives every replica of a Service the same private hostname, so a pool runs one runner. For more runners, declare more pools.
+`ClusterRailway.ServicePool` runs one Railway Service, built from the bundled runner program, in the database's environment. Each of its `replicas` is a runner, and they serve the pool's shard group together. Railway gives every replica the same private hostname, which is the gateway callers reach, so each runner registers under its own private address instead: the one it reaches the database from.
 
 ```typescript title="src/Cluster.ts"
-export const Default = ClusterRailway.ServicePool("Default", { region: "us-west2" }).pipe(
-  Layer.provide(Database),
-);
+export const Default = ClusterRailway.ServicePool("Default", {
+  replicas: 3,
+  region: "us-west2",
+}).pipe(Layer.provide(Database));
 ```
 
-`Cluster.Database.fromUrl` does not tell the pool where to run. Pass `project` to the pool, and pass `environment` if you are not using the project's primary environment.
+Omit `replicas` to leave the count as it is, one when the Service is created. Changing it updates the Service in place: Railway starts one deployment that replaces every replica with the image it already built. Railway stops each old runner with `SIGTERM`, and it hands its shards back before it exits, so the new runners take them within seconds. A runner that crashes leaves the shard assignments at the next health check, which runs every 5 seconds, or sooner if Railway restarts it under the same address. Callers retry a request that couldn't reach a gateway, while its hostname still lists a runner that has stopped.
+
+`Cluster.Database.fromUrl` does not tell the pool where to run. Pass `project` to the pool, and pass `environment` if you are not using the project's primary environment. A pool on such a database runs one runner under its Service's hostname, and doesn't take `replicas`.
 
 ## Call it from a Railway Service
 

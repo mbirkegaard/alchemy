@@ -1,0 +1,55 @@
+name: Verify pinned Effect Cluster drafts on Docker Swarm
+
+on:
+  push:
+    branches: [test/verify-cluster-swarm-d2ca3de]
+
+permissions:
+  contents: read
+
+jobs:
+  swarm:
+    name: Swarm (${{ matrix.pr }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pr: '#3678'
+            sha: d2ca3de15e2c6cb8406a8d6f3166d48314e9bcce
+          - pr: '#3736'
+            sha: c98c059e2982312ae5a062b8926468adec7a5db3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+
+      - name: Verify checkout and Docker
+        env:
+          TEST_SHA: ${{ matrix.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$TEST_SHA"
+          git log -1 --oneline
+          docker version
+          docker info --format 'Swarm at start: {{.Swarm.LocalNodeState}}'
+
+      - name: Checkout distilled
+        run: git submodule update --init --depth=1 --checkout -- submodules/distilled
+
+      - name: Set up pnpm, Node.js and Bun
+        uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
+        with:
+          install: true
+          require-lockfile: true
+
+      - name: Run Docker and Domain cluster suites
+        run: pnpm test:integration test/Cluster/Docker.test.ts test/Cluster/Domain.test.ts --retry 0 --concurrency 1
+
+      - name: Leave runner-local Swarm
+        if: always()
+        run: |
+          if [ "$(docker info --format '{{.Swarm.LocalNodeState}}')" = active ]; then
+            docker swarm leave --force
+          fi

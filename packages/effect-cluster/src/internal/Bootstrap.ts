@@ -44,10 +44,12 @@ import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as HttpClient from "effect/http/HttpClient";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
+import * as LogLevel from "effect/LogLevel";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Redacted from "effect/Redacted";
 import * as Ref from "effect/Ref";
+import * as References from "effect/References";
 import type { Rpc, RpcGroup } from "effect/rpc";
 import * as Schedule from "effect/Schedule";
 import type { Workflow as EffectWorkflow } from "effect/workflow";
@@ -313,6 +315,24 @@ const stopSignal = (budgetMs: number) =>
     });
   });
 
+/**
+ * `CLUSTER_LOG_LEVEL` (`Debug`, `Trace`, …): the runner's minimum log level,
+ * to see what Effect Cluster does (shard assignments, health checks,
+ * messages) on a runner. Unset, it logs at `Info`.
+ */
+const logLevel = Layer.unwrap(
+  Config.Literals(LogLevel.values, "CLUSTER_LOG_LEVEL").pipe(
+    Config.option,
+    Effect.map(
+      Option.match({
+        onNone: () => Layer.empty,
+        onSome: (level) => Layer.succeed(References.MinimumLogLevel, level),
+      }),
+    ),
+    Effect.orDie,
+  ),
+);
+
 /** How often the pool checks that its runners are reachable. */
 const RUNNER_HEALTH_CHECK_INTERVAL = Duration.seconds(5);
 
@@ -417,6 +437,7 @@ export const bootstrap = (
     NodeServices.layer,
     FetchHttpClient.layer,
     Logger.layer([Logger.consolePretty()]),
+    logLevel,
   ).pipe(Layer.provideMerge(stackFromEnv), Layer.provideMerge(RuntimeConfigProviderLive));
 
   const program = Effect.gen(function* () {

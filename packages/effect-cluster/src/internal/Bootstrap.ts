@@ -76,15 +76,13 @@ const inIpv4Range = (address: string, range: string) => {
 };
 
 /**
- * The address other runners reach this one at: an explicit
- * `CLUSTER_RUNNER_HOST`, else with `CLUSTER_RUNNER_ROUTE=database` the
- * local address its route to the database leaves from, else the local
+ * The address other runners reach this one at: with
+ * `CLUSTER_RUNNER_ROUTE=database` the local address its route to the
+ * database leaves from, else an explicit `CLUSTER_RUNNER_HOST`, else the local
  * address that `CLUSTER_PEERS` (a DNS name every runner resolves to)
  * lists, else the first non-internal IPv4 address.
  */
 const runnerHost = Effect.gen(function* () {
-  const explicit = env("CLUSTER_RUNNER_HOST");
-  if (explicit) return explicit;
   const local = Object.values(networkInterfaces())
     .flat()
     .filter((iface) => iface !== undefined && !iface.internal)
@@ -92,9 +90,13 @@ const runnerHost = Effect.gen(function* () {
     // Link-local addresses (an agent's, a metadata endpoint's) aren't reachable.
     .filter((address) => !address.startsWith("169.254.") && !address.startsWith("fe80:"));
   // Replicas that share a hostname: the address this runner reaches the
-  // cluster's database from, on the private network they share.
-  const route = yield* Config.option(Config.Literal("database", "CLUSTER_RUNNER_ROUTE"));
-  if (Option.isSome(route)) return yield* routedAddress(local);
+  // cluster's database from, on the private network they share. First, so
+  // a host left over from a one-runner pool can't make them share it. Any
+  // other value, such as an empty one, is unset.
+  const route = yield* Config.option(Config.String("CLUSTER_RUNNER_ROUTE"));
+  if (Option.getOrUndefined(route) === "database") return yield* routedAddress(local);
+  const explicit = env("CLUSTER_RUNNER_HOST");
+  if (explicit) return explicit;
   // On a private network with a known range, the address in it.
   const range = env("CLUSTER_RUNNER_NETWORK");
   if (range) {
@@ -278,8 +280,12 @@ export class ExternalProgramExited extends Data.TaggedError("Cluster.ExternalPro
  * is signalled. Unset, a runner ignores SIGTERM like any process with no
  * handler (as PID 1 in a container), and is killed with its shards held.
  */
-const shutdownBudget = Config.option(Config.Int("CLUSTER_SHUTDOWN_TIMEOUT_MS")).pipe(
-  Effect.map((budget) => Option.getOrUndefined(Option.filter(budget, (ms) => ms > 0))),
+const shutdownBudget = Config.option(Config.String("CLUSTER_SHUTDOWN_TIMEOUT_MS")).pipe(
+  Effect.map((budget) => {
+    const value = Option.getOrUndefined(budget);
+    // Empty, as a pool that no longer stops gracefully leaves it: unset.
+    return value !== undefined && /^[1-9][0-9]*$/.test(value) ? Number(value) : undefined;
+  }),
 );
 
 /**

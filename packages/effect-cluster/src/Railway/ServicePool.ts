@@ -146,8 +146,11 @@ export const ServicePool = (
             ...env,
             // Railway's private network is IPv6: listen on every address.
             CLUSTER_LISTEN_HOST: "::",
+            // Railway keeps a variable a deploy no longer sets: set every
+            // one, so switching between the two never inherits the other's.
             ...(ownAddress
               ? {
+                  CLUSTER_RUNNER_HOST: "",
                   CLUSTER_RUNNER_ROUTE: "database",
                   // Railway stops a runner with SIGTERM on every deploy,
                   // restart and scale: it hands its shards back and
@@ -158,8 +161,12 @@ export const ServicePool = (
                   // within seconds, not when its registration expires.
                   RUNNER_HEALTH_CHECK_INTERVAL: "5 seconds",
                 }
-              : // The one runner registers under the hostname the others resolve.
-                { CLUSTER_RUNNER_HOST: "${{RAILWAY_PRIVATE_DOMAIN}}" }),
+              : {
+                  // The one runner registers under the hostname the others resolve.
+                  CLUSTER_RUNNER_HOST: "${{RAILWAY_PRIVATE_DOMAIN}}",
+                  CLUSTER_RUNNER_ROUTE: "",
+                  CLUSTER_SHUTDOWN_TIMEOUT_MS: "",
+                }),
           })),
         ),
       }).pipe(Effect.asVoid);

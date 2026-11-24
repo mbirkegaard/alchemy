@@ -11,7 +11,7 @@ jobs:
   swarm:
     name: Swarm (${{ matrix.variant }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 48
+    timeout-minutes: 52
     strategy:
       fail-fast: false
       matrix:
@@ -21,7 +21,7 @@ jobs:
           - variant: network-and-single-ping
             sha: 6ac9842025b3ae4d73442da061860f3ba5aa8882
           - variant: all-fixes
-            sha: f0469e8f2e1e9198d0c2911c654c029ece86e7f1
+            sha: 6a0fcb0c512e9a4f83e848e87ba7d9ca3312ccf8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -47,6 +47,12 @@ jobs:
           fixture=packages/integration-tests/test/Docker/Runtime.ts
           test "$(grep -c 'http://localhost:' "$fixture")" -eq 1
           sed -i 's|http://localhost:|http://127.0.0.1:|' "$fixture"
+          # Use the same readiness probe on every variant, without changing product code.
+          readiness=6a0fcb0c512e9a4f83e848e87ba7d9ca3312ccf8
+          if [ "$(git rev-parse HEAD)" != "$readiness" ]; then
+            git fetch --no-tags --depth=2 origin "$readiness"
+            git diff "$readiness^" "$readiness" -- packages/integration-tests/test/Domain/conformance/conformance.ts | git apply
+          fi
           git diff --check
           git diff --stat
       - name: Run suites and collect runner diagnostics
@@ -79,6 +85,10 @@ jobs:
               -t "a killed runner's keys answer again" --retry 0 --concurrency 1 \
               2>&1 | tee "$evidence/crash-$round.log" || result=1
             grep -Eq 'Tests: 0 failed \| 1 passed' "$evidence/crash-$round.log" || result=1
+            full_log=$(sed -n 's/^Full log: \([^ ]*\).*/\1/p' "$evidence/crash-$round.log" | tail -1)
+            if [ -n "$full_log" ] && [ -f "$full_log" ]; then
+              grep -E 'every key answered' "$full_log" > "$evidence/recovery-$round.log" || true
+            fi
           done
           grep -hE 'Tests:|every key answered|is unreachable' "$evidence"/*.log || true
           exit "$result"

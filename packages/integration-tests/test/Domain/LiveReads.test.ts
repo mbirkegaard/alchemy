@@ -1,20 +1,25 @@
+import { createServer } from "node:http";
 import * as Domain from "@alchemy.run/domain";
 import { InMemory } from "@alchemy.run/domain/InMemory";
 import { describe, expect, it } from "@alchemy.run/test";
 import * as BunHttpServer from "@effect/platform-bun/BunHttpServer";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as Clock from "effect/Clock";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as HttpServer from "effect/http/HttpServer";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
+import * as Ref from "effect/Ref";
 import * as RpcMiddleware from "effect/rpc/RpcMiddleware";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Socket from "effect/socket/Socket";
 import * as Stream from "effect/Stream";
 import { liveFrame } from "./conformance/conformance.ts";
+import { relayTo } from "./fixtures/relay.ts";
 
 class Incremented extends Domain.Event("Incremented", { by: Schema.Number }) {}
 class Increment extends Domain.Command("Increment", {
@@ -384,5 +389,87 @@ describe("Domain live reads whose verdict runs out", { tags: ["unit", "local"] }
       Effect.scoped,
       Effect.provide(GatedSocketWire),
     ),
+  );
+});
+
+// Live reads over HTTP to a real server, through a relay the test cuts, as a
+// server replaced mid-response would: the read is sent again and goes on.
+const CutWire = Layer.unwrap(
+  Effect.gen(function* () {
+    const server = yield* HttpServer.HttpServer;
+    const port = "port" in server.address ? server.address.port : 0;
+    const relay = yield* relayTo(port);
+    return CounterApi.layerClient.pipe(
+      Layer.provide(Domain.protocolHttp(`http://127.0.0.1:${relay.port}`)),
+      Layer.provide(FetchHttpClient.layer),
+      Layer.merge(Layer.succeed(Relay, relay)),
+    );
+  }),
+).pipe(
+  Layer.provideMerge(
+    Layer.unwrap(Effect.map(CounterApi, (api) => HttpServer.serve()(api.fetch))).pipe(
+      Layer.provideMerge(NodeHttpServer.layer(createServer, { port: 0 })),
+    ),
+  ),
+  Layer.provideMerge(Hosted),
+);
+
+/** The relay between the client and the server. */
+class Relay extends Context.Service<Relay, Effect.Success<ReturnType<typeof relayTo>>>()(
+  "test/Domain/LiveReads/Relay",
+) {}
+
+/** Wait until `got` holds `n` items. */
+const until = <A>(got: Ref.Ref<ReadonlyArray<A>>, n: number) =>
+  Ref.get(got).pipe(
+    Effect.filterOrFail((items) => items.length >= n),
+    Effect.retry({ schedule: Schedule.spaced("20 millis"), times: 250 }),
+  );
+
+describe("Domain live reads over HTTP whose connection is cut", { tags: ["unit", "local"] }, () => {
+  it.live("events resume after the last entry, sending nothing twice", () =>
+    Effect.gen(function* () {
+      const api = yield* seed;
+      const relay = yield* Relay;
+      const got = yield* Ref.make<ReadonlyArray<Frame>>([]);
+      const feed = yield* api.Bumps.events("c-1").pipe(
+        Stream.tap((frame) => Ref.update(got, (all) => [...all, frame])),
+        Stream.take(6),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* until(got, 4);
+      expect(yield* relay.cut).toBeGreaterThan(0);
+      // The resumed read says where it caught up again before anything new.
+      yield* until(got, 5);
+      yield* api.Increment({ id: "c-1", by: 4 });
+      expect(frames(yield* Fiber.join(feed))).toEqual([
+        1,
+        2,
+        3,
+        "caught up at 3",
+        "caught up at 3",
+        4,
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(CutWire)),
+  );
+
+  it.live("watch starts again from the key's current state", () =>
+    Effect.gen(function* () {
+      const api = yield* seed;
+      const relay = yield* Relay;
+      const got = yield* Ref.make<ReadonlyArray<{ readonly cursor: number }>>([]);
+      const watched = yield* api.Totals.watch("c-1").pipe(
+        Stream.tap((state) => Ref.update(got, (all) => [...all, state])),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* until(got, 1);
+      expect(yield* relay.cut).toBeGreaterThan(0);
+      yield* until(got, 2);
+      yield* api.Increment({ id: "c-1", by: 4 });
+      expect((yield* Fiber.join(watched)).map((state) => state.cursor)).toEqual([3, 3, 4]);
+    }).pipe(Effect.scoped, Effect.provide(CutWire)),
   );
 });

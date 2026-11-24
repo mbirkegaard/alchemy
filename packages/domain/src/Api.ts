@@ -1482,13 +1482,102 @@ export const make = <
 /**
  * The HTTP protocol for an Api client (NDJSON, so streams work). Live reads
  * are streamed responses, which the platform feeds by polling the key; use
- * {@link protocolWebSocket} to have them pushed instead. Requires an
- * `HttpClient`, e.g. `FetchHttpClient.layer`.
+ * {@link protocolWebSocket} to have them pushed instead. A live read whose
+ * response is cut before it ends (the server it reached was replaced or
+ * restarted, a proxy closed the connection) is sent again: `watch` starts
+ * from the key's current state, `events` resumes after the last entry it
+ * delivered, so nothing is sent twice or skipped. Requires an `HttpClient`,
+ * e.g. `FetchHttpClient.layer`.
  */
 export const protocolHttp = (
   url: string,
 ): Layer.Layer<RpcClient.Protocol, never, HttpClient.HttpClient> =>
-  RpcClient.layerProtocolHttp({ url }).pipe(Layer.provide(RpcSerialization.layerNdjson));
+  Layer.effect(
+    RpcClient.Protocol,
+    Effect.gen(function* () {
+      const client = HttpClient.mapRequest(
+        yield* HttpClient.HttpClient,
+        HttpClientRequest.prependUrl(url),
+      );
+      const http = yield* RpcClient.makeProtocolHttp(client).pipe(
+        Effect.provide(RpcSerialization.layerNdjson),
+      );
+      /** What each live read in flight has delivered, by request id. */
+      const reads = new Map<string, { delivered: boolean; ended: boolean; after?: number }>();
+      /** Note what a frame delivers to a live read: its end, or how far `events` got. */
+      const observe = (message: RpcMessage.FromServerEncoded) => {
+        if (!("requestId" in message)) return;
+        const read = reads.get(String(message.requestId));
+        if (read === undefined) return;
+        if (message._tag === "Exit") read.ended = true;
+        if (message._tag !== "Chunk") return;
+        read.delivered = true;
+        for (const value of message.values as ReadonlyArray<unknown>) {
+          const after = deliveredCursor(value);
+          if (after !== undefined) read.after = after;
+        }
+      };
+      const liveRead = (
+        clientId: number,
+        request: RpcMessage.RequestEncoded,
+        transferables?: ReadonlyArray<globalThis.Transferable>,
+      ) =>
+        Effect.gen(function* () {
+          const read: { delivered: boolean; ended: boolean; after?: number } = {
+            delivered: false,
+            ended: false,
+          };
+          reads.set(String(request.id), read);
+          let failures = 0;
+          while (true) {
+            read.delivered = false;
+            const resumed =
+              read.after !== undefined && request.tag.endsWith(".events")
+                ? { ...request, payload: { ...(request.payload as object), after: read.after } }
+                : request;
+            const exit = yield* Effect.exit(http.send(clientId, resumed, transferables));
+            // The server ended the read (with its result or a rejection): done.
+            if (read.ended || Exit.isSuccess(exit) || Exit.hasInterrupts(exit)) return yield* exit;
+            if (read.delivered) failures = 0;
+            // A response cut short: send the read again, as the WebSocket protocol reconnects.
+            if (++failures > RECONNECTS) {
+              return yield* RpcClientError.RpcClientError.make({
+                reason: RpcClientError.RpcClientDefect.make({
+                  message: `Live read ${request.tag} lost its connection`,
+                  cause: Cause.squash(exit.cause),
+                }),
+              });
+            }
+            yield* Effect.sleep(Duration.millis(Math.min(5_000, 100 * 2 ** failures)));
+          }
+        }).pipe(Effect.ensuring(Effect.sync(() => reads.delete(String(request.id)))));
+      return RpcClient.Protocol.of({
+        run: (clientId, write) =>
+          http.run(clientId, (message) => {
+            observe(message);
+            return write(message);
+          }),
+        send: (clientId, request, transferables) =>
+          request._tag === "Request" && isLiveRead(request.tag)
+            ? liveRead(clientId, request, transferables)
+            : http.send(clientId, request, transferables),
+        supportsAck: false,
+        supportsTransferables: false,
+        codecFor: http.codecFor,
+      });
+    }),
+  );
+
+/**
+ * Where a delivered `events` frame leaves the read: an entry's `seq`, or a
+ * `CaughtUp` frame's cursor. Undefined for anything else (a `watch` state).
+ */
+const deliveredCursor = (value: unknown): number | undefined => {
+  if (typeof value !== "object" || value === null) return undefined;
+  const frame = value as { _tag?: unknown; cursor?: unknown; envelope?: { seq?: unknown } };
+  if (frame._tag === "CaughtUp" && typeof frame.cursor === "number") return frame.cursor;
+  return typeof frame.envelope?.seq === "number" ? frame.envelope.seq : undefined;
+};
 
 /**
  * The protocol for a client in the same process as the model. It serves the

@@ -28,6 +28,7 @@ import {
   RunnerAddress,
   Singleton,
 } from "effect/cluster";
+import * as Config from "effect/Config";
 import * as Context from "effect/Context";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
@@ -92,7 +93,8 @@ const runnerHost = Effect.gen(function* () {
     .filter((address) => !address.startsWith("169.254.") && !address.startsWith("fe80:"));
   // Replicas that share a hostname: the address this runner reaches the
   // cluster's database from, on the private network they share.
-  if (env("CLUSTER_RUNNER_ROUTE") === "database") return yield* routedAddress(local);
+  const route = yield* Config.option(Config.Literal("database", "CLUSTER_RUNNER_ROUTE"));
+  if (Option.isSome(route)) return yield* routedAddress(local);
   // On a private network with a known range, the address in it.
   const range = env("CLUSTER_RUNNER_NETWORK");
   if (range) {
@@ -145,8 +147,12 @@ export class RunnerAddressNotFound extends Data.TaggedError("Cluster.RunnerAddre
  * whatever order the interfaces are in. Connecting a UDP socket sends
  * nothing. Waits a bounded while for the host to resolve.
  */
-const routedAddress = (local: ReadonlyArray<string>) => {
-  const route = urlHost(env("CLUSTER_DATABASE_URL") ?? env("DATABASE_URL") ?? "");
+const routedAddress = Effect.fnUntraced(function* (local: ReadonlyArray<string>) {
+  const route = yield* Config.Redacted("CLUSTER_DATABASE_URL").pipe(
+    Config.map(Redacted.value),
+    Config.map(urlHost),
+  );
+  const replica = Option.getOrUndefined(yield* Config.option(Config.String("RAILWAY_REPLICA_ID")));
   /** The local address a datagram to `target` would leave from. */
   const source = (target: { address: string; family: number }) => {
     const socket = createSocket(target.family === 6 ? "udp6" : "udp4");
@@ -155,7 +161,7 @@ const routedAddress = (local: ReadonlyArray<string>) => {
       socket.connect(9, target.address, () => resolve(socket.address().address));
     }).finally(() => socket.close());
   };
-  return Effect.tryPromise({
+  return yield* Effect.tryPromise({
     try: async () => {
       const targets = (await lookup(route, { all: true })).toSorted((a, b) => b.family - a.family);
       const tried: string[] = [];
@@ -177,7 +183,7 @@ const routedAddress = (local: ReadonlyArray<string>) => {
     Effect.tap(({ target, from }) =>
       Effect.logInfo(
         `Effect Cluster runner address ${from}: routes to ${route} (${target}); own [${local.join(", ")}]${
-          env("RAILWAY_REPLICA_ID") ? `, replica ${env("RAILWAY_REPLICA_ID")}` : ""
+          replica === undefined ? "" : `, replica ${replica}`
         }`,
       ),
     ),
@@ -186,7 +192,7 @@ const routedAddress = (local: ReadonlyArray<string>) => {
     Effect.retry({ schedule: Schedule.spaced("2 seconds"), times: 30 }),
     Effect.orDie,
   );
-};
+});
 
 /** A URL's host, never its credentials. */
 const urlHost = (url: string) => {
@@ -272,10 +278,9 @@ export class ExternalProgramExited extends Data.TaggedError("Cluster.ExternalPro
  * is signalled. Unset, a runner ignores SIGTERM like any process with no
  * handler (as PID 1 in a container), and is killed with its shards held.
  */
-const shutdownBudget = () => {
-  const value = env("CLUSTER_SHUTDOWN_TIMEOUT_MS");
-  return value !== undefined && /^[1-9][0-9]*$/.test(value) ? Number(value) : undefined;
-};
+const shutdownBudget = Config.option(Config.Int("CLUSTER_SHUTDOWN_TIMEOUT_MS")).pipe(
+  Effect.map((budget) => Option.getOrUndefined(Option.filter(budget, (ms) => ms > 0))),
+);
 
 /**
  * Succeeds on the first SIGTERM or SIGINT. From then on, a native timer
@@ -466,7 +471,7 @@ export const bootstrap = (
         Layer.provide(cluster),
       ),
     );
-    const budget = shutdownBudget();
+    const budget = yield* shutdownBudget;
     // Stopping interrupts the runner, whose cluster hands its shards back
     // and unregisters it on the way out, so the others take its shards now
     // rather than once its registration expires.

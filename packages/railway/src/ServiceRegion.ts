@@ -128,7 +128,7 @@ const readEnvironmentConfig = Query.fn((args: { id: string; projectId?: string }
 }));
 
 const environmentPatchCommit = Query.fn(
-  (args: { environmentId: string; commitMessage: string; patch: unknown }) =>
+  (args: { environmentId: string; commitMessage: string; patch: unknown; skipDeploys?: boolean }) =>
     Railway.environmentPatchCommit(args),
 );
 
@@ -203,9 +203,12 @@ const waitUntilRegion = (input: {
  * without `region`, they run in the service's current single region.
  * Replica moves go through `environmentPatchCommit`
  * (`services[id].deploy.multiRegionConfig`), the same patch Railway's CLI
- * applies for `railway scale`.
+ * applies for `railway scale`. Railway starts a deployment for every such
+ * commit that replaces each replica; with `skipDeploys` the commit only
+ * stages the placement for the caller's own next deploy. `patched` says
+ * whether there was anything to commit.
  */
-export const syncServiceRegion = Effect.fn(function* (input: {
+export const placeServiceRegion = Effect.fn(function* (input: {
   environmentId: string;
   projectId: string;
   serviceId: string;
@@ -213,14 +216,15 @@ export const syncServiceRegion = Effect.fn(function* (input: {
   legacy?: string | null;
   fallbackReplicas?: number | null;
   replicas?: number | undefined;
+  skipDeploys?: boolean | undefined;
 }) {
   if (input.region === undefined && input.replicas === undefined) {
-    return yield* readServiceRegion(input);
+    return { region: yield* readServiceRegion(input), patched: false };
   }
   const desired = input.region ?? (yield* readServiceRegion(input));
   // Nowhere to count replicas yet (a service never placed, or spread
   // over several regions): leave the placement as it is.
-  if (desired === undefined) return desired;
+  if (desired === undefined) return { region: desired, patched: false };
   const patched = yield* withEnvironmentConfigLock(
     input.environmentId,
     Effect.gen(function* () {
@@ -245,10 +249,15 @@ export const syncServiceRegion = Effect.fn(function* (input: {
             },
           },
         },
+        ...(input.skipDeploys === true ? { skipDeploys: true } : {}),
       });
       return true;
     }),
   );
-  if (!patched) return desired;
-  return yield* waitUntilRegion({ ...input, region: desired });
+  if (!patched) return { region: desired, patched };
+  return { region: yield* waitUntilRegion({ ...input, region: desired }), patched };
 });
+
+/** {@link placeServiceRegion}, for the region it leaves the service in. */
+export const syncServiceRegion = (input: Parameters<typeof placeServiceRegion>[0]) =>
+  Effect.map(placeServiceRegion(input), ({ region }) => region);

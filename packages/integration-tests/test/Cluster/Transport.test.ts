@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { createServer as createHttpServer } from "node:http";
+import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 /**
  * How calls reach a pool when the process at the other end restarts or goes
@@ -11,6 +13,7 @@ import { describe, expect, it } from "@alchemy.run/test";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Queue from "effect/Queue";
 import * as Schedule from "effect/Schedule";
 import { freePort, relayTo } from "./fixtures/relay.ts";
 import { AnySlow, TOKEN } from "./fixtures/transport/slow.ts";
@@ -103,5 +106,140 @@ describe("Cluster calls through a gateway", { tags: ["provider:cluster", "unit",
         expect(yield* runsOf(gatewayPort, "slow")).toEqual(1);
       }),
     { timeout: 30_000 },
+  );
+});
+
+const requestProgram = fileURLToPath(
+  new URL("./fixtures/transport/runner-request.ts", import.meta.url),
+);
+
+/**
+ * A runner's peer: answers `/hit?id=&ms=` after `ms`, counting the requests
+ * for each `id`.
+ */
+const peer = Effect.acquireRelease(
+  Effect.callback<{ port: number; hits: Map<string, number>; close: () => void }>((resume) => {
+    const hits = new Map<string, number>();
+    const server = createHttpServer((request, response) => {
+      const url = new URL(request.url ?? "/", "http://peer");
+      const id = url.searchParams.get("id") ?? "";
+      hits.set(id, (hits.get(id) ?? 0) + 1);
+      setTimeout(() => response.end("ok"), Number(url.searchParams.get("ms") ?? 0));
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      resume(
+        Effect.succeed({
+          port: typeof address === "object" && address !== null ? address.port : 0,
+          hits,
+          close: () => server.close(),
+        }),
+      );
+    });
+  }),
+  ({ close }) => Effect.sync(close),
+);
+
+interface Answer {
+  readonly url: string;
+  readonly ok: boolean;
+  readonly ms: number;
+  readonly error?: string;
+}
+
+/**
+ * A Node process sending requests as a runner does (runners run on Node);
+ * `get` waits for its answer.
+ */
+const runnerSending = Effect.gen(function* () {
+  const answers = yield* Queue.unbounded<Answer>();
+  const child = yield* Effect.acquireRelease(
+    Effect.sync(() => spawn("node", [requestProgram], { stdio: ["pipe", "pipe", "ignore"] })),
+    (child) => Effect.sync(() => child.kill("SIGKILL")),
+  );
+  createInterface({ input: child.stdout! }).on("line", (line) =>
+    Queue.offerUnsafe(answers, JSON.parse(line) as Answer),
+  );
+  return {
+    get: (url: string) =>
+      Effect.sync(() => child.stdin!.write(`${url}\n`)).pipe(Effect.andThen(Queue.take(answers))),
+  };
+});
+
+describe(
+  "Cluster requests between runners",
+  { tags: ["provider:cluster", "unit", "local"] },
+  () => {
+    it.live(
+      "a request to a runner that vanished without closing its connection fails within seconds",
+      () =>
+        Effect.gen(function* () {
+          const server = yield* peer;
+          const relay = yield* relayTo(server.port);
+          const runner = yield* runnerSending;
+          // A connection to the peer is open and kept for the next request.
+          expect((yield* runner.get(`http://127.0.0.1:${relay.port}/hit?id=warm`)).ok).toBe(true);
+          // The peer vanishes as a removed Railway replica does: the open
+          // connection takes the next request and answers nothing.
+          yield* relay.goSilent;
+          const answer = yield* runner
+            .get(`http://127.0.0.1:${relay.port}/hit?id=gone`)
+            .pipe(Effect.timeout("10 seconds"));
+          expect(relay.swallowed()).toBeGreaterThan(0);
+          // Failed, so Effect Cluster routes it again, instead of waiting.
+          expect(answer.ok).toBe(false);
+          expect(answer.ms).toBeLessThan(5_000);
+        }),
+      { timeout: 30_000 },
+    );
+
+    it.live(
+      "a slow answer from a runner that is up is waited for, and sent once",
+      () =>
+        Effect.gen(function* () {
+          const server = yield* peer;
+          const relay = yield* relayTo(server.port);
+          const runner = yield* runnerSending;
+          const answer = yield* runner.get(`http://127.0.0.1:${relay.port}/hit?id=slow&ms=4000`);
+          expect(answer.ok).toBe(true);
+          expect(answer.ms).toBeGreaterThanOrEqual(4_000);
+          expect(server.hits.get("slow")).toEqual(1);
+        }),
+      { timeout: 30_000 },
+    );
+  },
+);
+
+const gatewayStopProgram = fileURLToPath(
+  new URL("./fixtures/transport/gateway-stop.ts", import.meta.url),
+);
+
+describe("Cluster gateway shutdown", { tags: ["provider:cluster", "unit", "local"] }, () => {
+  it.live(
+    "a stopping gateway lets a request left open run for 2 seconds, not 20",
+    () =>
+      Effect.gen(function* () {
+        const port = yield* freePort;
+        const lines = yield* Queue.unbounded<string>();
+        // On Node, as runners run: Bun's server closes open connections itself.
+        const child = yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            spawn("node", [gatewayStopProgram, String(port)], {
+              stdio: ["pipe", "pipe", "ignore"],
+            }),
+          ),
+          (child) => Effect.sync(() => child.kill("SIGKILL")),
+        );
+        createInterface({ input: child.stdout! }).on("line", (line) =>
+          Queue.offerUnsafe(lines, line),
+        );
+        expect(yield* Queue.take(lines)).toEqual("ready");
+        const response = yield* Effect.promise(() => fetch(`http://127.0.0.1:${port}/`));
+        expect(response.status).toEqual(200);
+        child.stdin!.write("stop\n");
+        const stoppedMs = Number(yield* Queue.take(lines).pipe(Effect.timeout("30 seconds")));
+        expect(stoppedMs).toBeLessThan(5_000);
+      }),
+    { timeout: 45_000 },
   );
 });

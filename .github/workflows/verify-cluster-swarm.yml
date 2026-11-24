@@ -1,4 +1,4 @@
-name: Verify pinned Effect Cluster drafts on Docker Swarm
+name: Compare upstream Effect Cluster baselines on Docker Swarm
 
 on:
   push:
@@ -16,13 +16,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - pr: '#3678'
-            sha: d2ca3de15e2c6cb8406a8d6f3166d48314e9bcce
-          - pr: '#3736'
-            sha: c98c059e2982312ae5a062b8926468adec7a5db3
+          - pr: 'main at draft base'
+            sha: 6a7c4e672595befd341c6d4e435038c9c2c569f4
+          - pr: 'current upstream main'
+            sha: 20b6b0b00ddc45c067525bd36d57c1c3d7d41cd5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: alchemy-run/alchemy
           ref: ${{ matrix.sha }}
           persist-credentials: false
 
@@ -68,6 +69,16 @@ jobs:
           test "$(grep -c 'http://localhost:' "$fixture")" -eq 1
           sed -i 's|http://localhost:|http://127.0.0.1:|' "$fixture"
           git diff -- "$fixture"
+
+      - name: Add the same crash timing probe to main without product changes
+        run: |
+          base=6a7c4e672595befd341c6d4e435038c9c2c569f4
+          draft=c98c059e2982312ae5a062b8926468adec7a5db3
+          fixture=packages/integration-tests/test/Cluster/fixtures/domain/crash.ts
+          git fetch --no-tags --depth=1 https://github.com/mbirkegaard/alchemy.git "$base" "$draft"
+          git diff "$base" "$draft" -- "$fixture" | git apply
+          git diff --check
+          git diff --stat
 
       - name: Run Docker and Domain separately and capture failed stack diagnostics
         run: |

@@ -1502,37 +1502,57 @@ export const protocolHttp = (
       const http = yield* RpcClient.makeProtocolHttp(client).pipe(
         Effect.provide(RpcSerialization.layerNdjson),
       );
-      /** What each live read in flight has delivered, by request id. */
-      const reads = new Map<string, { delivered: boolean; ended: boolean; after?: number }>();
-      /** Note what a frame delivers to a live read: its end, or how far `events` got. */
-      const observe = (message: RpcMessage.FromServerEncoded) => {
-        if (!("requestId" in message)) return;
-        const read = reads.get(String(message.requestId));
-        if (read === undefined) return;
+      /** What each live read in flight has delivered, by client and request id. */
+      const reads = new Map<string, LiveReadState>();
+      const keyOf = (clientId: number, requestId: string | number | bigint) =>
+        `${clientId}/${requestId}`;
+      /**
+       * Note what a frame delivers to a live read (its end, how far `events`
+       * got), and drop an `events` entry the read already delivered, which a
+       * resumed read can be sent again: what's left to deliver, if anything.
+       */
+      const deliver = (
+        clientId: number,
+        message: RpcMessage.FromServerEncoded,
+      ): RpcMessage.FromServerEncoded | undefined => {
+        if (!("requestId" in message)) return message;
+        const read = reads.get(keyOf(clientId, message.requestId));
+        if (read === undefined) return message;
         if (message._tag === "Exit") read.ended = true;
-        if (message._tag !== "Chunk") return;
-        read.delivered = true;
-        for (const value of message.values as ReadonlyArray<unknown>) {
+        if (message._tag !== "Chunk") return message;
+        const values = (message.values as ReadonlyArray<unknown>).filter((value) => {
+          const seq = entrySeq(value);
+          if (read.events && seq !== undefined && read.after !== undefined && seq <= read.after) {
+            return false;
+          }
           const after = deliveredCursor(value);
           if (after !== undefined) read.after = after;
-        }
+          return true;
+        });
+        if (values.length === 0) return undefined;
+        read.delivered = true;
+        return values.length === message.values.length
+          ? message
+          : { ...message, values: values as unknown as typeof message.values };
       };
       const liveRead = (
         clientId: number,
         request: RpcMessage.RequestEncoded,
         transferables?: ReadonlyArray<globalThis.Transferable>,
-      ) =>
-        Effect.gen(function* () {
-          const read: { delivered: boolean; ended: boolean; after?: number } = {
+      ) => {
+        const key = keyOf(clientId, request.id);
+        return Effect.gen(function* () {
+          const read: LiveReadState = {
             delivered: false,
             ended: false,
+            events: request.tag.endsWith(".events"),
           };
-          reads.set(String(request.id), read);
+          reads.set(key, read);
           let failures = 0;
           while (true) {
             read.delivered = false;
             const resumed =
-              read.after !== undefined && request.tag.endsWith(".events")
+              read.after !== undefined && read.events
                 ? { ...request, payload: { ...(request.payload as object), after: read.after } }
                 : request;
             const exit = yield* Effect.exit(http.send(clientId, resumed, transferables));
@@ -1550,12 +1570,13 @@ export const protocolHttp = (
             }
             yield* Effect.sleep(Duration.millis(Math.min(5_000, 100 * 2 ** failures)));
           }
-        }).pipe(Effect.ensuring(Effect.sync(() => reads.delete(String(request.id)))));
+        }).pipe(Effect.ensuring(Effect.sync(() => reads.delete(key))));
+      };
       return RpcClient.Protocol.of({
         run: (clientId, write) =>
           http.run(clientId, (message) => {
-            observe(message);
-            return write(message);
+            const left = deliver(clientId, message);
+            return left === undefined ? Effect.void : write(left);
           }),
         send: (clientId, request, transferables) =>
           request._tag === "Request" && isLiveRead(request.tag)
@@ -1567,6 +1588,26 @@ export const protocolHttp = (
       });
     }),
   );
+
+/** What an HTTP live read in flight has delivered. */
+interface LiveReadState {
+  /** Whether the attempt in flight delivered anything. */
+  delivered: boolean;
+  /** Whether the server ended the read. */
+  ended: boolean;
+  /** Whether it is an `events` read, which resumes after `after`. */
+  readonly events: boolean;
+  /** The `seq` the read has delivered up to, once it has. */
+  after?: number;
+}
+
+/** The `seq` of an `events` entry; undefined for a `CaughtUp` frame or a `watch` state. */
+const entrySeq = (value: unknown): number | undefined => {
+  if (typeof value !== "object" || value === null) return undefined;
+  const frame = value as { _tag?: unknown; envelope?: { seq?: unknown } };
+  if (frame._tag === "CaughtUp") return undefined;
+  return typeof frame.envelope?.seq === "number" ? frame.envelope.seq : undefined;
+};
 
 /**
  * Where a delivered `events` frame leaves the read: an entry's `seq`, or a

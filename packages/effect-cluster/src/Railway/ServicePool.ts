@@ -104,8 +104,10 @@ export const ServicePool = (
     settings: options,
     expected: "a Railway project (ClusterRailway.Database)",
     networkOption: "project",
-    // A private hostname is one DNS label.
-    nameLength: 63,
+    // The name is the Service's, and its private hostname. Railway takes
+    // generated Service names of at most 32 characters (the limit the
+    // Railway provider gives its own), and rejects a longer one.
+    nameLength: 32,
     network: (database) => (database.network?.kind === "railway" ? database.network : undefined),
     ownNetwork: Effect.succeed(
       options.project === undefined

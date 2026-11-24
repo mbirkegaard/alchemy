@@ -11,7 +11,7 @@ jobs:
   swarm:
     name: Swarm (${{ matrix.pr }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 36
     strategy:
       fail-fast: false
       matrix:
@@ -44,8 +44,34 @@ jobs:
           install: true
           require-lockfile: true
 
-      - name: Run Docker and Domain cluster suites
-        run: pnpm test:integration test/Cluster/Docker.test.ts test/Cluster/Domain.test.ts --retry 0 --concurrency 1
+      - name: Check runner-local Swarm ingress
+        run: |
+          docker swarm init --advertise-addr 127.0.0.1
+          trap 'docker service rm ci-ingress-check' EXIT
+          docker service create --name ci-ingress-check --publish 18080:8080 busybox:1.37 sh -c 'mkdir /www && echo ready >/www/index.html && httpd -f -p 8080 -h /www'
+          docker service ps --no-trunc ci-ingress-check
+          curl --noproxy '*' --fail --retry 10 --retry-all-errors --retry-delay 2 --max-time 3 http://localhost:18080/
+          curl --noproxy '*' --fail --max-time 3 http://127.0.0.1:18080/
+
+      - name: Run Docker and Domain separately and capture failed stack diagnostics
+        run: |
+          result=0
+          for suite in Docker Domain; do
+            echo "::group::$suite suite"
+            if timeout --kill-after=15s 12m pnpm test:integration "test/Cluster/$suite.test.ts" --retry 0 --concurrency 1; then
+              echo "$suite passed"
+            else
+              result=1
+              docker service ls || true
+              docker ps -a || true
+              for service in $(docker service ls -q); do
+                docker service ps --no-trunc "$service" || true
+                timeout 10s docker service logs --tail 30 "$service" || true
+              done
+            fi
+            echo '::endgroup::'
+          done
+          exit "$result"
 
       - name: Leave runner-local Swarm
         if: always()

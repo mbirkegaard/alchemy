@@ -25,6 +25,7 @@ import {
   ClusterSchema,
   ClusterWorkflowEngine,
   Entity as EffectEntity,
+  Runner,
   RunnerAddress,
   Runners,
   RunnerStorage,
@@ -319,47 +320,77 @@ const RUNNER_HEALTH_CHECK_INTERVAL = Duration.seconds(5);
  * Effect Cluster's own runner health check is a singleton in the `default`
  * shard group, which no pool serves (an external program's entities live
  * there), so it never runs: a runner that crashed kept its shards until its
- * registration expired, 35 seconds later. The same check as a singleton in
- * the pool's own group: ping every registered runner, mark one that doesn't
- * answer unhealthy, which takes its shards off it, and healthy once it
- * answers again. The last healthy runner is never marked.
+ * registration expired, 35 seconds later. The pool runs the check itself,
+ * on every runner and without a singleton, so the crash of the runner doing
+ * it can't stall it either:
+ *
+ * - Every runner orders the pool's registered runners by address. The first
+ *   one that answers a ping is the checker: it pings every runner, marks one
+ *   that doesn't answer unhealthy (which takes its shards off it) and one
+ *   that answers again healthy. The last healthy runner is never marked.
+ * - Every other runner pings the runners before it, in order, and stops at
+ *   the first that answers. Only when none does, as when the checker itself
+ *   crashed, does it check the pool.
+ *
+ * So a pool of n runners pings about 2(n - 1) times and reads its runners n
+ * times per interval, and a crashed checker is replaced at the next one.
  */
-const runnerHealthCheck = (group: string) =>
-  Singleton.make(
-    "alchemy/RunnerHealth",
+const runnerHealthCheck = (group: string, self: RunnerAddress.RunnerAddress) =>
+  Layer.effectDiscard(
     Effect.gen(function* () {
       const storage = yield* RunnerStorage.RunnerStorage;
       const runners = yield* Runners.Runners;
+      const key = (address: RunnerAddress.RunnerAddress) => `${address.host}:${address.port}`;
       const isAlive = (address: RunnerAddress.RunnerAddress) =>
-        runners
-          .ping(address)
-          .pipe(
-            Effect.timeout("3 seconds"),
-            Effect.retry({ schedule: Schedule.spaced("500 millis"), times: 3 }),
-            Effect.isSuccess,
+        key(address) === key(self)
+          ? Effect.succeed(true)
+          : runners
+              .ping(address)
+              .pipe(
+                Effect.timeout("3 seconds"),
+                Effect.retry({ schedule: Schedule.spaced("500 millis"), times: 3 }),
+                Effect.isSuccess,
+              );
+      /** Mark every runner of the pool by whether it answers. */
+      const checkAll = (registered: ReadonlyArray<readonly [Runner.Runner, boolean]>) =>
+        Effect.gen(function* () {
+          let healthy = registered.filter(([, isHealthy]) => isHealthy).length;
+          yield* Effect.forEach(
+            registered,
+            ([runner, isHealthy]) =>
+              Effect.flatMap(isAlive(runner.address), (alive) => {
+                if (alive === isHealthy || (!alive && healthy <= 1)) return Effect.void;
+                healthy += alive ? 1 : -1;
+                return Effect.logInfo(
+                  `Effect Cluster runner ${key(runner.address)} is ${alive ? "reachable again" : "unreachable"}`,
+                ).pipe(Effect.andThen(storage.setRunnerHealth(runner.address, alive)));
+              }),
+            { concurrency: 10, discard: true },
           );
+        });
+      /** Whether a runner before this one in the order answers: then it checks. */
+      const anEarlierAnswers = (earlier: ReadonlyArray<Runner.Runner>): Effect.Effect<boolean> =>
+        earlier.length === 0
+          ? Effect.succeed(false)
+          : Effect.flatMap(isAlive(earlier[0]!.address), (alive) =>
+              alive ? Effect.succeed(true) : anEarlierAnswers(earlier.slice(1)),
+            );
       const check = Effect.gen(function* () {
-        const registered = yield* storage.getRunners;
-        let healthy = registered.filter(([, isHealthy]) => isHealthy).length;
-        yield* Effect.forEach(
-          registered,
-          ([runner, isHealthy]) =>
-            Effect.flatMap(isAlive(runner.address), (alive) => {
-              if (alive === isHealthy || (!alive && healthy <= 1)) return Effect.void;
-              healthy += alive ? 1 : -1;
-              return Effect.logInfo(
-                `Effect Cluster runner ${runner.address.host}:${runner.address.port} is ${alive ? "reachable again" : "unreachable"}`,
-              ).pipe(Effect.andThen(storage.setRunnerHealth(runner.address, alive)));
-            }),
-          { concurrency: 10, discard: true },
-        );
+        const registered = (yield* storage.getRunners)
+          .filter(([runner]) => runner.groups.includes(group))
+          .toSorted(([a], [b]) => key(a.address).localeCompare(key(b.address)));
+        const earlier = registered
+          .filter(([runner]) => key(runner.address).localeCompare(key(self)) < 0)
+          .map(([runner]) => runner);
+        if (yield* anEarlierAnswers(earlier)) return;
+        yield* checkAll(registered);
       }).pipe(Effect.catchCause((cause) => Effect.logWarning("Runner health check failed", cause)));
-      return yield* check.pipe(
+      yield* check.pipe(
         Effect.andThen(Effect.sleep(RUNNER_HEALTH_CHECK_INTERVAL)),
         Effect.forever,
+        Effect.forkScoped,
       );
     }),
-    { shardGroup: group },
   );
 
 /** The shard groups this pool serves, and every group in the cluster. */
@@ -538,7 +569,7 @@ export const bootstrap = (
         // What the classes' Construction phases handed the runner.
         ...launched,
         gateway,
-        runnerHealthCheck(group),
+        runnerHealthCheck(group, RunnerAddress.make(host, RUNNER_PORT)),
       ).pipe(
         // Workflows run on Effect Cluster's own engine, over the cluster.
         Layer.provide(ClusterWorkflowEngine.layer),

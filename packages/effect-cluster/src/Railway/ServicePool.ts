@@ -94,6 +94,13 @@ export interface ServicePoolOptions extends PoolSettings {
  *
  * @primitive
  */
+/**
+ * The private hostname Railway gives a Service named `name`: the name with
+ * each run of hyphens made one. A Service named `a--b` is reached at
+ * `a-b.railway.internal` (its `RAILWAY_PRIVATE_DOMAIN`), not `a--b`.
+ */
+const privateHostname = (name: string) => name.replace(/-{2,}/g, "-");
+
 export const ServicePool = (
   id: string,
   options: ServicePoolOptions = {},
@@ -115,9 +122,10 @@ export const ServicePool = (
         : { kind: "railway" as const, project: options.project, environment: options.environment },
     ),
     // Callers deploy before the runner exists, when a Railway reference to
-    // it would render empty. The Service is created with this name, which is
-    // its private hostname.
-    gateway: (name) => Effect.succeed({ url: `http://${name}.railway.internal:${GATEWAY_PORT}` }),
+    // it would render empty. The Service is created with this name, and
+    // Railway derives its private hostname from it.
+    gateway: (name) =>
+      Effect.succeed({ url: `http://${privateHostname(name)}.railway.internal:${GATEWAY_PORT}` }),
     nodes: ({ database, network, name, program, environment }) => {
       // On the project's private network a runner has an address of its
       // own: the one it reaches the database from. With a database

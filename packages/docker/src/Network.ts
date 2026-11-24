@@ -8,6 +8,7 @@ import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
 import * as Net from "effect/net";
 import * as Result from "effect/Result";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import { Docker, dockerEngineContextName, dockerPhysicalName } from "./Docker.ts";
 import type { Providers } from "./Providers.ts";
@@ -288,23 +289,34 @@ export const NetworkProvider = () =>
           // authoritative even if the generator would name this id differently
           // today. Only an explicit user-provided name can force a replace.
           const desiredName = news?.name ?? output.name;
+          // A swarm network recorded before the swarm allocated it has no
+          // driver and no addresses: compare the network as it is now.
+          const observed =
+            output.driver === ""
+              ? ((yield* docker.network
+                  .inspect(output.id, dockerEngineContextName(olds?.context))
+                  .pipe(
+                    Effect.map(toNetworkAttributes),
+                    Effect.catchReason("PlatformError", "NotFound", () => Effect.undefined),
+                  )) ?? output)
+              : output;
           if (
             output.name !== desiredName ||
-            output.driver !== args.driver ||
-            (output.internal ?? false) !== (args.internal ?? false) ||
-            (output.attachable ?? false) !== (args.attachable ?? false) ||
-            allocatesIPv4(output.driver, output.enableIPv4) !== (args.ipv4 ?? true) ||
-            output.enableIPv6 !== args.ipv6 ||
-            !matchesOptions(output.driverOpts ?? {}, args.opt ?? {}) ||
+            observed.driver !== args.driver ||
+            (observed.internal ?? false) !== (args.internal ?? false) ||
+            (observed.attachable ?? false) !== (args.attachable ?? false) ||
+            allocatesIPv4(observed.driver, observed.enableIPv4) !== (args.ipv4 ?? true) ||
+            observed.enableIPv6 !== args.ipv6 ||
+            !matchesOptions(observed.driverOpts ?? {}, args.opt ?? {}) ||
             hasRemovedOptions(olds?.driverOpts, news?.driverOpts) ||
             !matchesIpam(
-              output.ipam ?? { driver: "default", options: {}, config: [] },
+              observed.ipam ?? { driver: "default", options: {}, config: [] },
               news?.ipam,
               olds?.ipam,
             ) ||
             // Compare only user labels; internal `alchemy::*` branding lives on
             // the observed network but must not drive replacement.
-            !Equal.equals(stripInternalTags(output.labels), args.label ?? {})
+            !Equal.equals(stripInternalTags(observed.labels), args.label ?? {})
           ) {
             return { action: "replace", deleteFirst: true };
           }
@@ -332,9 +344,28 @@ export const NetworkProvider = () =>
         reconcile: Effect.fn(function* ({ output, id, instanceId, news }) {
           const context = dockerEngineContextName(news?.context);
           const args = yield* makeNetworkArgs(id, news, instanceId);
-          if (output) {
-            const refreshed = yield* docker.network.inspect(output.id, context).pipe(
+          // A swarm (overlay) network is created at once, but the swarm
+          // manager fills in its driver and addresses a moment later; until
+          // then Docker reports it with no driver. Recorded that way, the next
+          // deploy saw a changed driver and replaced the network.
+          const inspectAllocated = (network: string) =>
+            docker.network.inspect(network, context).pipe(
+              Effect.repeat({
+                until: isAllocated,
+                schedule: Schedule.spaced("100 millis"),
+                times: 100,
+              }),
+              Effect.filterOrFail(
+                isAllocated,
+                (info) =>
+                  new NetworkNotAllocated({
+                    message: `Docker.Network '${info.Name}': the swarm did not allocate it in 10 seconds`,
+                  }),
+              ),
               Effect.map(toNetworkAttributes),
+            );
+          if (output) {
+            const refreshed = yield* inspectAllocated(output.id).pipe(
               Effect.catchReason("PlatformError", "NotFound", () => Effect.undefined),
             );
             if (refreshed) return refreshed;
@@ -345,7 +376,7 @@ export const NetworkProvider = () =>
             label: { ...args.label, ...internalTags },
             context,
           });
-          return toNetworkAttributes(yield* docker.network.inspect(createdId, context));
+          return yield* inspectAllocated(createdId);
         }),
         delete: Effect.fn(({ olds, output }) =>
           docker.network
@@ -363,6 +394,14 @@ export const NetworkProvider = () =>
  */
 const networkName = (id: string, props: NetworkProps | undefined, instanceId: string) =>
   dockerPhysicalName(id, props, instanceId, props?.driver === "overlay" ? 63 : undefined);
+
+/** A swarm network the swarm manager has not allocated a driver and addresses for. */
+export class NetworkNotAllocated extends Data.TaggedError("NetworkNotAllocated")<{
+  readonly message: string;
+}> {}
+
+/** Whether Docker reports the network allocated: a swarm network has a driver once it is. */
+const isAllocated = (info: Docker.Network) => info.Scope !== "swarm" || info.Driver !== "";
 
 /** Invalid user-supplied network settings, detected before Docker is called. */
 export class InvalidNetworkOptions extends Data.TaggedError("InvalidNetworkOptions")<{

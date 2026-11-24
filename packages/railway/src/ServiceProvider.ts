@@ -19,6 +19,7 @@ import { deepEqual, isResolved, stripEffects } from "alchemy/Diff";
 import * as Provider from "alchemy/Provider";
 import { Stack } from "alchemy/Stack";
 import { tarGzipDirectory } from "alchemy/Util/tarGzip";
+import * as Clock from "effect/Clock";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as Schedule from "effect/Schedule";
@@ -110,7 +111,15 @@ export {
 export class ServiceNotCreated extends Data.TaggedError("Railway.ServiceNotCreated")<{
   resourceName: string;
   projectId: string;
-}> {}
+  /** What Railway answered `serviceCreate` with, when it refused. */
+  reason?: string;
+}> {
+  override get message() {
+    return `Railway did not create service ${this.resourceName} in project ${this.projectId}${
+      this.reason === undefined ? "" : `: ${this.reason}`
+    }`;
+  }
+}
 
 export class ServiceProjectRequired extends Data.TaggedError("Railway.ServiceProjectRequired")<{
   message: string;
@@ -540,10 +549,50 @@ const fetchDeployLogs = (deploymentId: string | undefined) =>
         Effect.orElseSucceed(() => ""),
       );
 
+/** How long a deployment may take once Railway has started it. */
+const DEPLOY_WAIT_MS = 150_000;
+/**
+ * How long a deployment may sit `QUEUED` first. Railway queues a build until
+ * the workspace has a free build slot ("Waiting for build slot"), which can
+ * take minutes while other builds run; the deployment is fine meanwhile.
+ */
+const QUEUED_WAIT_MS = 20 * 60_000;
+
+/**
+ * Run `once` until it stops failing with `ServiceDeployPending`: for up to
+ * 150 s, and for as long as the deployment is `QUEUED` (up to 20 minutes),
+ * the 150 s starting over while it is.
+ */
+const untilDeployed = <A, E, R>(
+  serviceId: string,
+  once: Effect.Effect<A, E | ServiceDeployPending, R>,
+) =>
+  Effect.gen(function* () {
+    const started = yield* Clock.currentTimeMillis;
+    let deadline = started + DEPLOY_WAIT_MS;
+    const keepWaiting = (pending: ServiceDeployPending) =>
+      Effect.map(Clock.currentTimeMillis, (now) => {
+        if (pending.status === "QUEUED" && now < started + QUEUED_WAIT_MS) {
+          deadline = Math.max(deadline, now + DEPLOY_WAIT_MS);
+        }
+        return now < deadline;
+      });
+    return yield* once.pipe(
+      Effect.retry({
+        while: (e) => (e instanceof ServiceDeployPending ? keepWaiting(e) : Effect.succeed(false)),
+        schedule: Schedule.spaced("10 seconds"),
+      }),
+    );
+  }).pipe(
+    Effect.timeoutOrElse({
+      duration: QUEUED_WAIT_MS + DEPLOY_WAIT_MS,
+      orElse: () => Effect.fail(new ServiceDeployPending({ serviceId, status: "pending" })),
+    }),
+  );
+
 // Railway builds routinely take 60–90s and exceed 90s when its build queue is
 // busy (observed 2026-10: a small bundled service stuck BUILDING past 90s), so
-// a 90s cap failed healthy deploys. Allow up to 150 seconds while bounding
-// both the retry count and time spent in API requests.
+// a 90s cap failed healthy deploys: allow 150 seconds once a deployment runs.
 const waitForDeployment = (environmentId: string, serviceId: string) =>
   Effect.gen(function* () {
     const instance = yield* getInstance(environmentId, serviceId);
@@ -557,17 +606,7 @@ const waitForDeployment = (environmentId: string, serviceId: string) =>
       return instance;
     }
     return yield* new ServiceDeployPending({ serviceId, status: status ?? "pending" });
-  }).pipe(
-    Effect.retry({
-      while: (e) => e._tag === "Railway.ServiceDeployPending",
-      times: 15,
-      schedule: Schedule.spaced("10 seconds"),
-    }),
-    Effect.timeoutOrElse({
-      duration: "150 seconds",
-      orElse: () => Effect.fail(new ServiceDeployPending({ serviceId, status: "pending" })),
-    }),
-  );
+  }).pipe((once) => untilDeployed(serviceId, once));
 
 type DeployRef = { id: string; status: string | undefined };
 
@@ -611,6 +650,19 @@ const waitForDeploymentById = (input: {
   serviceId: string;
   environmentId: string;
 }) =>
+  untilDeployed(input.serviceId, waitForDeploymentOnce(input)).pipe(
+    // A pending deploy at the end gets one final check: a ready instance, or
+    // a failed deploy with its logs.
+    Effect.catchTag("Railway.ServiceDeployPending", (pending) =>
+      finalDeploymentCheck(input, pending),
+    ),
+  );
+
+const waitForDeploymentOnce = (input: {
+  deploymentId: string;
+  serviceId: string;
+  environmentId: string;
+}) =>
   Effect.gen(function* () {
     // Poll the instance, not `deployment(id)`. Distilled's deployment
     // query is a huge nested selection that 404s/times out for /up ids;
@@ -642,45 +694,36 @@ const waitForDeploymentById = (input: {
       serviceId: input.serviceId,
       status: status ?? "pending",
     });
-  }).pipe(
-    Effect.retry({
-      while: (e) => e._tag === "Railway.ServiceDeployPending",
-      times: 15,
-      schedule: Schedule.spaced("10 seconds"),
-    }),
-    // Surface the budget as a pending deploy so the final check below still
-    // reports a ready instance, or a failed deploy with its logs.
-    Effect.timeoutOrElse({
-      duration: "150 seconds",
-      orElse: () =>
-        Effect.fail(new ServiceDeployPending({ serviceId: input.serviceId, status: "pending" })),
-    }),
-    Effect.catchTag("Railway.ServiceDeployPending", (pending) =>
-      Effect.gen(function* () {
-        const instance = yield* getInstance(input.environmentId, input.serviceId);
-        const match =
-          matchUploadedDeployment(instance, input.deploymentId) ??
-          asDeployRef(yield* listUploadedDeployment(input));
-        const status = match?.status;
-        if (match !== undefined && status !== undefined && deployFailed(status)) {
-          const logs = yield* fetchDeployLogs(match.id);
-          return yield* new ServiceDeployFailed({
-            serviceId: input.serviceId,
-            status,
-            deploymentId: match.id,
-            logs,
-          });
-        }
-        if (instance !== undefined && deployReady(status)) {
-          return instance;
-        }
-        return yield* new ServiceDeployPending({
-          serviceId: input.serviceId,
-          status: status ?? pending.status,
-        });
-      }).pipe(Effect.timeoutOrElse({ duration: "10 seconds", orElse: () => Effect.fail(pending) })),
-    ),
-  );
+  });
+
+/** After the wait: a ready instance, a failed deploy with its logs, or still pending. */
+const finalDeploymentCheck = (
+  input: { deploymentId: string; serviceId: string; environmentId: string },
+  pending: ServiceDeployPending,
+) =>
+  Effect.gen(function* () {
+    const instance = yield* getInstance(input.environmentId, input.serviceId);
+    const match =
+      matchUploadedDeployment(instance, input.deploymentId) ??
+      asDeployRef(yield* listUploadedDeployment(input));
+    const status = match?.status;
+    if (match !== undefined && status !== undefined && deployFailed(status)) {
+      const logs = yield* fetchDeployLogs(match.id);
+      return yield* new ServiceDeployFailed({
+        serviceId: input.serviceId,
+        status,
+        deploymentId: match.id,
+        logs,
+      });
+    }
+    if (instance !== undefined && deployReady(status)) {
+      return instance;
+    }
+    return yield* new ServiceDeployPending({
+      serviceId: input.serviceId,
+      status: status ?? pending.status,
+    });
+  }).pipe(Effect.timeoutOrElse({ duration: "10 seconds", orElse: () => Effect.fail(pending) }));
 
 const variableUpsert = Query.fn((input: VariableUpsertInput) => Railway.variableUpsert({ input }));
 
@@ -1128,6 +1171,7 @@ export const ServiceProvider = () =>
               ? { repo: sourceRepo }
               : { image: sourceImage ?? "hashicorp/http-echo" };
           const existed = current !== undefined;
+          let refused: string | undefined;
           if (current === undefined) {
             const created = yield* serviceCreate({
               projectId,
@@ -1137,12 +1181,23 @@ export const ServiceProvider = () =>
               ...(sourceRepo !== undefined && props.branch !== undefined
                 ? { branch: props.branch }
                 : {}),
-            }).pipe(Effect.catchTag("RailwayValidationError", () => Effect.undefined));
+            }).pipe(
+              Effect.catchTag("RailwayValidationError", (error) =>
+                Effect.sync(() => {
+                  refused = error.message;
+                  return undefined;
+                }),
+              ),
+            );
             current = created ?? (yield* findByName(projectId, name));
           }
 
           if (current === undefined || isGoneService(current)) {
-            return yield* new ServiceNotCreated({ resourceName: name, projectId });
+            return yield* new ServiceNotCreated({
+              resourceName: name,
+              projectId,
+              ...(refused === undefined ? {} : { reason: refused }),
+            });
           }
 
           if (current.name !== name) {

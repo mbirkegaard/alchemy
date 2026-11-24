@@ -50,9 +50,13 @@ const get = <T>(base: string, path: string) =>
     return (yield* response.json) as T;
   });
 
-/** Wait for the front to serve. */
+/**
+ * Wait for the front to serve. `/ready` answers `ok` as text, not JSON: read
+ * as JSON, it never parsed, and every wait ran its whole three minutes.
+ */
 export const waitForReady = (url: string) =>
-  get<unknown>(url, "/ready").pipe(
+  Effect.flatMap(HttpClient.HttpClient, (client) => client.get(`${url}/ready`)).pipe(
+    Effect.filterOrFail((response) => response.status === 200),
     Effect.catch(() => Effect.fail("not ready")),
     Effect.retry({ schedule: Schedule.spaced("3 seconds"), times: 60 }),
     Effect.ignore,

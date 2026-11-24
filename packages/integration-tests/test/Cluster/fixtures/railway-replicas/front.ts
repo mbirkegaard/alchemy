@@ -32,7 +32,8 @@ export default class ReplicasFront extends Railway.Service<ReplicasFront>()(
           .filter((part) => part.length > 0);
         switch (route) {
           case "ready":
-            return HttpServerResponse.text("ok");
+            // JSON: the suite reads every route of the front as JSON.
+            return yield* HttpServerResponse.json("ok");
           case "where":
             return yield* HttpServerResponse.json(yield* (yield* replicas.getByName(id)).Where());
           case "credit":

@@ -34,7 +34,7 @@ const RECHECK = Duration.seconds(2);
 const CONNECT_MS = 2_000;
 
 /** Does `host:port` accept a new TCP connection in time? */
-const accepts = (host: string, port: number) =>
+export const accepts = (host: string, port: number) =>
   Effect.callback<boolean>((resume) => {
     let settled = false;
     const socket = connect({ host, port, timeout: CONNECT_MS });
